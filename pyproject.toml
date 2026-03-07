@@ -1,0 +1,19 @@
+[project]
+name = "imageindexer"
+version = "1.0.0"
+description = "Image indexing tool with LLM support"
+requires-python = ">=3.10, <3.14"
+dependencies = [
+    "pyqt6",
+    "json-repair",
+    "pyexiftool",
+    "pillow",
+    "pillow-heif",
+    "rawpy",
+    "regex",
+    "requests",
+    "rapidfuzz",
+]
+
+[dependency-groups]
+dev = []

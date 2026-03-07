@@ -1,0 +1,53 @@
+# ── Virtual environments ───────────────────────────────────────────────────
+.venv/
+llmii_env/
+venv/
+env/
+
+# ── Python bytecode ────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── User-specific runtime config ───────────────────────────────────────────
+*.json
+!mastertags.json
+resources/*
+!resources/README.md
+
+# ── LLM model files ────────────────────────────────────────────────────────
+*.gguf
+*.ggml
+*.bin
+
+# ── Executables ────────────────────────────────────────────────────────────
+*.exe
+koboldcpp*
+
+# ── Zip extraction temp folder ─────────────────────────────────────────────
+/temp/
+
+# ── Accidental copies / scratch directories ────────────────────────────────
+/dev/
+src - Copy/
+
+# ── Lock files ──────────────────────────────────────────────────────────────
+uv.lock
+poetry.lock
+Pipfile.lock
+
+# ── Log files ───────────────────────────────────────────────────────────────
+*.log
+*.log.*
+logs/
+
+# ── OS / editor noise ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+*.swp
+.idea/
+.vscode/
+*.iml
