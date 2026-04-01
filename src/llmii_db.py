@@ -1766,3 +1766,41 @@ def export_keywords_csv(conn, output_path):
 
     return len(image_data)
 
+
+def get_processed_paths(conn, directory_prefix=None):
+    """Return a set of normalised file paths that have been successfully processed.
+
+    Used by the resume-session feature to pre-populate the BackgroundIndexer
+    skip-set so that already-done files are never sent to ExifTool.
+
+    Args:
+        conn: active psycopg2 connection
+        directory_prefix: if given, only return paths under this directory
+    """
+    with conn.cursor() as cur:
+        if directory_prefix:
+            prefix = os.path.normpath(directory_prefix)
+            # Match both forward and backslash variants
+            cur.execute(
+                f"""
+                SELECT i.path
+                FROM   {_SCHEMA}.images i
+                JOIN   {_SCHEMA}.image_run_status irs ON irs.image_id = i.id
+                WHERE  irs.status = 'success'
+                  AND  (i.path LIKE %s OR i.path LIKE %s)
+                """,
+                (
+                    prefix.replace('\\', '/') + '%',
+                    prefix.replace('/', '\\') + '%',
+                ),
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT i.path
+                FROM   {_SCHEMA}.images i
+                JOIN   {_SCHEMA}.image_run_status irs ON irs.image_id = i.id
+                WHERE  irs.status = 'success'
+                """
+            )
+        return {os.path.normpath(row[0]) for row in cur.fetchall()}

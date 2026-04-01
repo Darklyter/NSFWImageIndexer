@@ -1765,6 +1765,8 @@ class ImageIndexerGUI(QMainWindow):
         button_layout = QHBoxLayout()
         self.run_button = QPushButton("Run Image Indexer")
         self.run_button.clicked.connect(self.run_indexer)
+        self.resume_button = QPushButton("Resume Session")
+        self.resume_button.clicked.connect(self.resume_indexer)
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self.toggle_pause)
         self.pause_button.setEnabled(False)
@@ -1772,6 +1774,7 @@ class ImageIndexerGUI(QMainWindow):
         self.stop_button.clicked.connect(self.stop_indexer)
         self.stop_button.setEnabled(False)
         button_layout.addWidget(self.run_button)
+        button_layout.addWidget(self.resume_button)
         button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.stop_button)
         controls_layout.addLayout(button_layout)
@@ -2198,8 +2201,52 @@ class ImageIndexerGUI(QMainWindow):
         self.first_button.setEnabled(history_size > 1 and (self.current_position > 0 or self.current_position == -1))
         self.prev_button.setEnabled(history_size > 1 and (self.current_position > 0 or self.current_position == -1))
           
-    def run_indexer(self):
-        
+    def resume_indexer(self):
+        """Check for resumable state, confirm with user, then start with resume=True."""
+        from pathlib import Path as _Path
+        directory = self.dir_input.text()
+        output_mode = (
+            'db'   if self.settings_dialog.output_db_radio.isChecked() else
+            'both' if self.settings_dialog.output_both_radio.isChecked() else
+            'json'
+        )
+
+        if output_mode in ('db', 'both'):
+            msg = (
+                "Resume will query the database to find already-processed files "
+                "and skip them entirely — no ExifTool reads for completed files.\n\n"
+                "Continue?"
+            )
+        else:
+            cp = _Path(__file__).resolve().parent.parent / 'llmii_checkpoint.json'
+            if cp.exists():
+                try:
+                    import json as _json
+                    data = _json.loads(cp.read_text(encoding='utf-8'))
+                    import os as _os
+                    if _os.path.normpath(data.get('directory', '')) == _os.path.normpath(directory):
+                        n = len(data.get('processed_paths', []))
+                        msg = (
+                            f"Found checkpoint: {n:,} previously-processed files will be skipped.\n\n"
+                            "Continue?"
+                        )
+                    else:
+                        msg = (
+                            "Checkpoint found but it is for a different directory.\n"
+                            "A fresh run will start with no files skipped.\n\nContinue?"
+                        )
+                except Exception:
+                    msg = "Checkpoint file found but could not be read. Starting fresh.\n\nContinue?"
+            else:
+                msg = "No checkpoint file found. A normal run will start.\n\nContinue?"
+
+        reply = QMessageBox.question(self, "Resume Session", msg)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.run_indexer(resume=True)
+
+    def run_indexer(self, resume=False):
+
         if not self.api_is_ready:
             QMessageBox.warning(self, "API Not Ready", 
                               "Please wait for the API to be available before running the indexer.")
@@ -2210,7 +2257,8 @@ class ImageIndexerGUI(QMainWindow):
         self.update_navigation_buttons()
         
         config = llmii.Config()
-        
+        config.resume_session = resume
+
         self.image_preview.setText("No image processed yet")
         self.filename_label.setText("Filename: ")
         self.caption_label.setText("No caption generated yet")
@@ -2330,6 +2378,7 @@ class ImageIndexerGUI(QMainWindow):
         self.output_area.clear()
         self.output_area.append("Running Image Indexer...")
         self.run_button.setEnabled(False)
+        self.resume_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
 
@@ -2355,12 +2404,14 @@ class ImageIndexerGUI(QMainWindow):
         self.pause_handler.stop_signal.emit()
         self.update_output("Stopping indexer...")
         self.run_button.setEnabled(True)
+        self.resume_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
     def indexer_finished(self):
         self.update_output("\nImage Indexer finished.")
         self.run_button.setEnabled(True)
+        self.resume_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.pause_button.setText("Pause")

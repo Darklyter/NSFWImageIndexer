@@ -1,7 +1,7 @@
 import os, json, time, re, argparse, exiftool, threading, queue, calendar, io, uuid, requests, shutil, zipfile
 from pathlib import Path
 from json_repair import repair_json as rj
-from datetime import timedelta
+from datetime import timedelta, datetime
 from .image_processor import ImageProcessor
 from .llmii_utils import first_json, de_pluralize, AND_EXCEPTIONS
 from . import llmii_db
@@ -576,6 +576,11 @@ class TagMatcher:
             pass
 
 
+def _checkpoint_path():
+    """Return the path to the session checkpoint file (project root)."""
+    return Path(__file__).resolve().parent.parent / 'llmii_checkpoint.json'
+
+
 class Config:
     def __init__(self):
         self.directory = None
@@ -590,6 +595,7 @@ class Config:
         self.reprocess_orphans = True
         self.reprocess_sparse = False       # reprocess images with fewer than N keywords
         self.reprocess_sparse_min = 5       # threshold for "sparse"
+        self.resume_session = False         # skip already-processed files on startup
         self.text_completion = False
         self.gen_count = 1500
         self.res_limit = 1280
@@ -960,13 +966,14 @@ class LLMProcessor:
             return None
 
 class BackgroundIndexer(threading.Thread):
-    def __init__(self, root_dir, metadata_queue, file_extensions, no_crawl=False, chunk_size=100, skip_folders=None):
+    def __init__(self, root_dir, metadata_queue, file_extensions, no_crawl=False, chunk_size=100, skip_folders=None, skip_paths=None):
         threading.Thread.__init__(self)
         self.root_dir = root_dir
         self.metadata_queue = metadata_queue
         self.file_extensions = file_extensions
         self.no_crawl = no_crawl
         self.skip_folders = skip_folders if skip_folders else []
+        self.skip_paths = skip_paths if skip_paths else set()
         self.total_files_found = 0
         self.total_directories = 0   # set before indexing starts; used for progress bars
         self.indexing_complete = False
@@ -1035,6 +1042,10 @@ class BackgroundIndexer(threading.Thread):
                 # Skip if not a valid file type
                 if not any(file_path.lower().endswith(ext) for ext in self.file_extensions):
                     continue
+
+                # Skip files already processed (resume-session fast-path)
+                if self.skip_paths and file_path in self.skip_paths:
+                    continue
                         
                 try:
                     # Check for 0 byte files
@@ -1066,7 +1077,7 @@ _BLACKLISTED = "__blacklisted__"
 
 
 class FileProcessor:
-    def __init__(self, config, check_paused_or_stopped=None, callback=None):
+    def __init__(self, config, check_paused_or_stopped=None, callback=None, skip_paths=None):
         self.config = config
         self.llm_processor = LLMProcessor(config)
         
@@ -1084,6 +1095,8 @@ class FileProcessor:
         self.total_processing_time = 0
         self.files_processed = 0
         self.files_completed = 0
+        self._checkpoint_paths = set(skip_paths) if skip_paths else set()
+        self._checkpoint_counter = 0
 
         # Zip extraction support
         # Maps temp_file_path → (composite_db_key, zip_source_name, zip_studio, [zip_performers])
@@ -1129,6 +1142,19 @@ class FileProcessor:
                 self.db_run_id = None
                 print(f"Database connection failed: {e}")
                 print("Continuing without database output.")
+
+        # If resuming and DB is available, load all previously-processed paths
+        # so BackgroundIndexer can skip them entirely (no ExifTool reads needed).
+        if getattr(config, 'resume_session', False) and self.db_conn:
+            try:
+                db_done = llmii_db.get_processed_paths(self.db_conn, config.directory)
+                skip_paths = (skip_paths or set()) | db_done
+                msg = f"Resume: {len(db_done):,} previously-processed files will be skipped."
+                print(msg)
+                if self.callback:
+                    self.callback(msg)
+            except Exception as e:
+                print(f"Warning: resume DB query failed: {e}")
 
         self.image_processor = ImageProcessor(max_dimension=self.config.res_limit, patch_sizes=[14])
 
@@ -1222,7 +1248,8 @@ class FileProcessor:
             all_exts,
             config.no_crawl,
             chunk_size=chunk_size,
-            skip_folders=skip_folders
+            skip_folders=skip_folders,
+            skip_paths=skip_paths,
         )
         
         self.indexer.start()
@@ -1408,6 +1435,19 @@ class FileProcessor:
             print(f"Extension fix failed: {str(e)}")
             return file_path
 
+    def _write_checkpoint(self):
+        """Persist processed paths to disk (non-DB mode only)."""
+        try:
+            data = {
+                'directory': str(self.config.directory),
+                'updated': datetime.now().isoformat(),
+                'files_processed': self.files_processed,
+                'processed_paths': list(self._checkpoint_paths),
+            }
+            _checkpoint_path().write_text(json.dumps(data), encoding='utf-8')
+        except Exception as e:
+            print(f"Warning: checkpoint write failed: {e}")
+
     def process_directory(self, directory):
         # Reload tag vocabulary from DB at the start of every run so that
         # aliases added via tag_review.py since the last run are picked up.
@@ -1490,6 +1530,10 @@ class FileProcessor:
                 self.callback("ExifTool process terminated cleanly")
             except Exception as e:
                 self.callback(f"Warning: ExifTool termination error: {str(e)}")
+
+            # Final checkpoint flush (non-DB mode)
+            if getattr(self.config, 'output_mode', 'json') not in ('db', 'both') and self._checkpoint_paths:
+                self._write_checkpoint()
 
             if self.db_conn and self.db_run_id:
                 try:
@@ -1739,6 +1783,16 @@ class FileProcessor:
                     self.process_file(new_metadata)
                     if on_file_done:
                         on_file_done()
+
+                    # Checkpoint (non-DB mode): track processed path and flush periodically
+                    if getattr(self.config, 'output_mode', 'json') not in ('db', 'both'):
+                        src = new_metadata.get('SourceFile')
+                        if src:
+                            self._checkpoint_paths.add(os.path.normpath(src))
+                            self._checkpoint_counter += 1
+                            if self._checkpoint_counter >= 500:
+                                self._write_checkpoint()
+                                self._checkpoint_counter = 0
 
                 if self.check_pause_stop():
                     return True
@@ -2949,9 +3003,33 @@ def main(config=None, callback=None, check_paused_or_stopped=None):
     
     if not hasattr(config, 'chunk_size'):
         config.chunk_size = 100
-             
+
+    # Resume: pre-load skip-set for non-DB mode from the checkpoint file.
+    # DB-mode skip-set is loaded inside FileProcessor after the connection opens.
+    skip_paths = None
+    if getattr(config, 'resume_session', False):
+        output_mode = getattr(config, 'output_mode', 'json')
+        if output_mode not in ('db', 'both'):
+            cp = _checkpoint_path()
+            if cp.exists():
+                try:
+                    data = json.loads(cp.read_text(encoding='utf-8'))
+                    if os.path.normpath(data.get('directory', '')) == os.path.normpath(str(config.directory)):
+                        paths = data.get('processed_paths', [])
+                        skip_paths = {os.path.normpath(p) for p in paths}
+                        msg = f"Resume: {len(skip_paths):,} previously-processed files will be skipped."
+                        print(msg)
+                        if callback:
+                            callback(msg)
+                    else:
+                        print("Checkpoint directory mismatch — starting fresh.")
+                        if callback:
+                            callback("Warning: checkpoint is for a different directory; starting fresh.")
+                except Exception as e:
+                    print(f"Warning: checkpoint load failed: {e}")
+
     file_processor = FileProcessor(
-        config, check_paused_or_stopped, callback
+        config, check_paused_or_stopped, callback, skip_paths=skip_paths
     )      
     
     try:

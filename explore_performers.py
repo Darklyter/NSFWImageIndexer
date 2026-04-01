@@ -281,6 +281,14 @@ class _TagChip(QLabel):
 
         menu.exec(self.mapToGlobal(pos))
 
+    def mouseDoubleClickEvent(self, event):
+        """Double-click removes the tag from this performer (same as right-click → Remove)."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._on_exclude_performer:
+                self._on_exclude_performer(self.tag_id)
+        else:
+            super().mouseDoubleClickEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # Add Tag dialog
@@ -555,13 +563,32 @@ class ExplorePerformersWindow(QMainWindow):
         atl = QVBoxLayout(at)
         atl.setContentsMargins(4, 4, 4, 4)
         atl.setSpacing(3)
+
+        # Header row with sort buttons
+        hdr_row = QHBoxLayout()
         self.img_tag_stats_hdr = QLabel("All Image Tags")
         self.img_tag_stats_hdr.setStyleSheet(
-            "QLabel { font-weight: bold; font-size: 11px; "
-            "border-bottom: 1px solid #aaa; padding: 3px 2px; }"
+            "QLabel { font-weight: bold; font-size: 11px; padding: 3px 2px; }"
         )
-        atl.addWidget(self.img_tag_stats_hdr)
-        self.img_tag_stats_info = QLabel("Tags from all images · excludes already-attached · right-click to attach")
+        hdr_row.addWidget(self.img_tag_stats_hdr, stretch=1)
+        self._tag_stats_sort = 'count'    # 'count' | 'alpha'
+        self._sort_count_btn = QPushButton("By Count")
+        self._sort_alpha_btn = QPushButton("A-Z")
+        for btn in (self._sort_count_btn, self._sort_alpha_btn):
+            btn.setFixedHeight(20)
+            btn.setStyleSheet(
+                "QPushButton { font-size: 10px; padding: 1px 6px; }"
+                "QPushButton:checked { background: #1a6fa8; color: white; }"
+            )
+            btn.setCheckable(True)
+        self._sort_count_btn.setChecked(True)
+        self._sort_count_btn.clicked.connect(lambda: self._set_tag_stats_sort('count'))
+        self._sort_alpha_btn.clicked.connect(lambda: self._set_tag_stats_sort('alpha'))
+        hdr_row.addWidget(self._sort_count_btn)
+        hdr_row.addWidget(self._sort_alpha_btn)
+        atl.addLayout(hdr_row)
+
+        self.img_tag_stats_info = QLabel("Double-click to attach · right-click for more options")
         self.img_tag_stats_info.setStyleSheet("color: #888; font-size: 10px;")
         self.img_tag_stats_info.setWordWrap(True)
         atl.addWidget(self.img_tag_stats_info)
@@ -574,6 +601,7 @@ class ExplorePerformersWindow(QMainWindow):
         )
         self.img_tag_stats_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.img_tag_stats_list.customContextMenuRequested.connect(self._on_tag_stats_context)
+        self.img_tag_stats_list.itemDoubleClicked.connect(self._on_tag_stats_double_click)
         atl.addWidget(self.img_tag_stats_list, stretch=1)
         right_splitter.addWidget(at)
 
@@ -873,13 +901,8 @@ class ExplorePerformersWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _load_image_tag_stats(self, performer_id):
-        """Populate the frequency-sorted tag list for the selected performer.
-
-        Shows every canonical tag that appears on at least one of this
-        performer's images, *excluding* tags already attached to the performer
-        (non-excluded rows in performer_tags).  Sorted by occurrence count.
-        """
-        rows = []
+        """Query tag frequencies for the selected performer and render the list."""
+        self._tag_stats_rows = []
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
@@ -895,12 +918,28 @@ class ExplorePerformersWindow(QMainWindow):
                                  AND  NOT excluded
                            )
                     GROUP  BY t.id, t.tag
-                    ORDER  BY cnt DESC, t.tag
                 """, (performer_id, performer_id))
-                rows = cur.fetchall()  # [(tag_id, tag_name, count), ...]
+                self._tag_stats_rows = cur.fetchall()  # [(tag_id, tag_name, count), ...]
         except Exception as e:
             print(f"Error loading image tag stats for {performer_id}: {e}")
             self.conn.rollback()
+
+        self._render_tag_stats()
+
+    def _set_tag_stats_sort(self, mode):
+        """Switch sort mode and re-render without re-querying the DB."""
+        self._tag_stats_sort = mode
+        self._sort_count_btn.setChecked(mode == 'count')
+        self._sort_alpha_btn.setChecked(mode == 'alpha')
+        self._render_tag_stats()
+
+    def _render_tag_stats(self):
+        """Re-render the All Image Tags list from the cached rows in the current sort order."""
+        rows = list(getattr(self, '_tag_stats_rows', []))
+        if self._tag_stats_sort == 'alpha':
+            rows.sort(key=lambda r: r[1].casefold())
+        else:
+            rows.sort(key=lambda r: (-r[2], r[1].casefold()))
 
         self.img_tag_stats_list.clear()
         total_images = len(self._images)
@@ -914,6 +953,13 @@ class ExplorePerformersWindow(QMainWindow):
         self.img_tag_stats_hdr.setText(
             f"All Image Tags  ({n})" if n else "All Image Tags"
         )
+
+    def _on_tag_stats_double_click(self, item):
+        """Double-clicking a tag in All Image Tags attaches it to the performer."""
+        if item is None or self._current_pid is None:
+            return
+        tag_id, tag_name = item.data(Qt.ItemDataRole.UserRole)
+        self._attach_tag_from_stats(tag_id, tag_name)
 
     def _on_tag_stats_context(self, pos):
         item = self.img_tag_stats_list.itemAt(pos)

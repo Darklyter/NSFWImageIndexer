@@ -901,6 +901,8 @@ class TagReviewWindow(QMainWindow):
         self.current_idx = 0
         self.all_tags = []       # canonical tag name strings
         self._cached_pixmap = None
+        self._image_paths = []   # [(path, description), …] for current keyword
+        self._image_idx = 0      # which image is being shown
         self._kw_dialog = None      # AllKeywordsDialog instance (kept open)
         self._bulk_dialog = None    # BulkAssignDialog instance (kept open)
         self._manage_dialog = None  # ManageTagsDialog instance (kept open)
@@ -957,6 +959,26 @@ class TagReviewWindow(QMainWindow):
             "background: #111; color: #666; border: 1px solid #333;"
         )
         left_col.addWidget(self.img_label, stretch=1)
+
+        # Image navigation row
+        img_nav = QHBoxLayout()
+        self.img_prev_btn = QPushButton("◄ Prev")
+        self.img_prev_btn.setFixedWidth(80)
+        self.img_prev_btn.setEnabled(False)
+        self.img_prev_btn.clicked.connect(self._img_prev)
+        self.img_nav_label = QLabel()
+        self.img_nav_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_nav_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.img_next_btn = QPushButton("Next ►")
+        self.img_next_btn.setFixedWidth(80)
+        self.img_next_btn.setEnabled(False)
+        self.img_next_btn.clicked.connect(self._img_next)
+        img_nav.addWidget(self.img_prev_btn)
+        img_nav.addStretch()
+        img_nav.addWidget(self.img_nav_label)
+        img_nav.addStretch()
+        img_nav.addWidget(self.img_next_btn)
+        left_col.addLayout(img_nav)
 
         self.path_label = QLabel()
         self.path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1316,36 +1338,53 @@ class TagReviewWindow(QMainWindow):
         self._load_image(keyword)
 
     def _load_image(self, keyword):
-        """Fetch one image path for this keyword and display it."""
+        """Fetch all images for this keyword and display the first one."""
+        self._image_paths = []
+        self._image_idx = 0
         self._cached_pixmap = None
         self.img_label.clear()
         self.img_label.setText("Image cannot be loaded")
         self.path_label.setText("")
         self.caption_label.setText("")
+        self.img_nav_label.setText("")
+        self.img_prev_btn.setEnabled(False)
+        self.img_next_btn.setEnabled(False)
 
-        row = None
         cur = self.conn.cursor()
         try:
             cur.execute("""
-                SELECT i.path, d.description
+                SELECT DISTINCT i.path, d.description
                 FROM image_keywords_unmatched iku
                 JOIN images i ON i.id = iku.image_id
                 LEFT JOIN image_descriptions d ON d.image_id = i.id
                 WHERE iku.keyword = %s
-                LIMIT 1
+                ORDER BY i.path
             """, (keyword,))
-            row = cur.fetchone()
+            self._image_paths = cur.fetchall()  # [(path, description), ...]
         except Exception:
             self.conn.rollback()
             return
         finally:
             cur.close()
 
-        if not row:
-            return
+        if self._image_paths:
+            self._show_image_at(0)
 
-        path, description = row[0], row[1]
+    def _show_image_at(self, idx):
+        """Display the image at position idx in self._image_paths."""
+        if not self._image_paths:
+            return
+        idx = max(0, min(idx, len(self._image_paths) - 1))
+        self._image_idx = idx
+
+        path, description = self._image_paths[idx]
+        total = len(self._image_paths)
+
         self.path_label.setText(path)
+        self.img_nav_label.setText(f"Image {idx + 1} of {total}")
+        self.img_prev_btn.setEnabled(idx > 0)
+        self.img_next_btn.setEnabled(idx < total - 1)
+
         if description:
             caption = description[:280]
             if len(description) > 280:
@@ -1354,6 +1393,9 @@ class TagReviewWindow(QMainWindow):
         else:
             self.caption_label.setText("")
 
+        self._cached_pixmap = None
+        self.img_label.clear()
+        self.img_label.setText("Image cannot be loaded")
         try:
             px = QPixmap(path)
             if not px.isNull():
@@ -1361,6 +1403,12 @@ class TagReviewWindow(QMainWindow):
                 self._display_scaled()
         except Exception:
             pass
+
+    def _img_prev(self):
+        self._show_image_at(self._image_idx - 1)
+
+    def _img_next(self):
+        self._show_image_at(self._image_idx + 1)
 
     def _display_scaled(self):
         if self._cached_pixmap is None:
