@@ -1462,6 +1462,7 @@ class FileProcessor:
         # stragglers from previous runs before any zip files are processed.
         self._clear_temp_dir()
 
+        self._run_completed_normally = False
         try:
             while not (self.indexer.indexing_complete and self.metadata_queue.empty()):
                 if self.check_pause_stop():
@@ -1524,6 +1525,7 @@ class FileProcessor:
 
                 except queue.Empty:
                     continue
+            self._run_completed_normally = True
         finally:
             try:
                 self.et.terminate()
@@ -1531,9 +1533,19 @@ class FileProcessor:
             except Exception as e:
                 self.callback(f"Warning: ExifTool termination error: {str(e)}")
 
-            # Final checkpoint flush (non-DB mode)
-            if getattr(self.config, 'output_mode', 'json') not in ('db', 'both') and self._checkpoint_paths:
-                self._write_checkpoint()
+            # Final checkpoint flush / cleanup (non-DB mode)
+            if getattr(self.config, 'output_mode', 'json') not in ('db', 'both'):
+                if self._run_completed_normally:
+                    # Full run finished — remove stale checkpoint so next run starts fresh
+                    try:
+                        cp = _checkpoint_path()
+                        if cp.exists():
+                            cp.unlink()
+                            print("Checkpoint file removed (run completed normally).")
+                    except Exception as e:
+                        print(f"Warning: could not remove checkpoint: {e}")
+                elif self._checkpoint_paths:
+                    self._write_checkpoint()
 
             if self.db_conn and self.db_run_id:
                 try:

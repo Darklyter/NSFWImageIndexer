@@ -399,6 +399,69 @@ def _section_hdr(text):
 
 
 # ---------------------------------------------------------------------------
+# Merge performer dialog
+# ---------------------------------------------------------------------------
+
+class _MergePerformerDialog(QDialog):
+    """Pick a target performer to merge the current performer into."""
+
+    def __init__(self, source_name, all_performers, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Merge '{source_name}' into…")
+        self.setMinimumSize(340, 480)
+        self.selected_id = None
+        self.selected_name = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"Select the performer that <b>{source_name}</b> should be merged into.<br>"
+            "All images and tags will move to the target. "
+            "The source performer will be deleted."
+        ))
+
+        search = QLineEdit()
+        search.setPlaceholderText("Filter…")
+        layout.addWidget(search)
+
+        self._list = QListWidget()
+        self._list.setAlternatingRowColors(True)
+        self._list.setStyleSheet(
+            "QListWidget::item { padding: 3px; }"
+            "QListWidget::item:selected { background: #1a6fa8; color: white; }"
+        )
+        for pid, name, total, processed in all_performers:
+            if name == source_name:
+                continue
+            item = QListWidgetItem(f"{name}  ({processed}/{total})" if total else f"{name}  (0)")
+            item.setData(Qt.ItemDataRole.UserRole, (pid, name))
+            self._list.addItem(item)
+        layout.addWidget(self._list, stretch=1)
+
+        def _filter(text):
+            needle = text.strip().lower()
+            for i in range(self._list.count()):
+                self._list.item(i).setHidden(
+                    bool(needle) and needle not in self._list.item(i).text().lower()
+                )
+        search.textChanged.connect(_filter)
+        self._list.itemDoubleClicked.connect(self._accept_item)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._accept_item)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _accept_item(self):
+        items = self._list.selectedItems()
+        if not items:
+            return
+        self.selected_id, self.selected_name = items[0].data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -459,6 +522,12 @@ class ExplorePerformersWindow(QMainWindow):
         self.perf_count_lbl = QLabel("")
         self.perf_count_lbl.setStyleSheet("color: #888; font-size: 10px;")
         ll.addWidget(self.perf_count_lbl)
+
+        self.merge_btn = QPushButton("Merge…")
+        self.merge_btn.setToolTip("Merge the selected performer into another (moves all images and tags)")
+        self.merge_btn.setEnabled(False)
+        self.merge_btn.clicked.connect(self._merge_performer)
+        ll.addWidget(self.merge_btn)
 
         self._main_splitter.addWidget(left)
 
@@ -660,9 +729,13 @@ class ExplorePerformersWindow(QMainWindow):
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT p.id, p.name, COUNT(ip.image_id) AS img_count
+                    SELECT p.id, p.name,
+                           COUNT(DISTINCT ip.image_id)  AS total_images,
+                           COUNT(DISTINCT irs.image_id) AS processed_images
                     FROM   performers p
-                    LEFT   JOIN image_performers ip ON ip.performer_id = p.id
+                    LEFT   JOIN image_performers ip  ON ip.performer_id = p.id
+                    LEFT   JOIN image_run_status irs
+                                ON irs.image_id = ip.image_id AND irs.status = 'success'
                     GROUP  BY p.id, p.name
                     ORDER  BY p.name
                 """)
@@ -676,8 +749,13 @@ class ExplorePerformersWindow(QMainWindow):
     def _repopulate_perf_list(self, rows):
         self.perf_list.blockSignals(True)
         self.perf_list.clear()
-        for pid, name, count in rows:
-            item = QListWidgetItem(f"{name}  ({count})")
+        for pid, name, total, processed in rows:
+            label = (
+                f"{name}  ({processed}/{total})"
+                if total > 0 else
+                f"{name}  (0)"
+            )
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, pid)
             self.perf_list.addItem(item)
         self.perf_list.blockSignals(False)
@@ -698,13 +776,14 @@ class ExplorePerformersWindow(QMainWindow):
         self._current_pid = pid
         # Resolve name from _all_performers
         self._current_pname = next(
-            (name for (p, name, _) in self._all_performers if p == pid), None
+            (name for (p, name, *_) in self._all_performers if p == pid), None
         )
         self._load_performer_images(pid)
         self._load_performer_tags(pid)
         self._load_image_tag_stats(pid)
         self.add_tag_btn.setEnabled(True)
         self.tag_review_btn.setEnabled(True)
+        self.merge_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Image list for current performer
@@ -995,6 +1074,77 @@ class ExplorePerformersWindow(QMainWindow):
             self._load_image_tag_stats(self._current_pid)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Merge performer
+    # ------------------------------------------------------------------
+
+    def _merge_performer(self):
+        if self._current_pid is None or self._current_pname is None:
+            return
+
+        dlg = _MergePerformerDialog(self._current_pname, self._all_performers, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected_id is None:
+            return
+
+        src_id   = self._current_pid
+        tgt_id   = dlg.selected_id
+        tgt_name = dlg.selected_name
+
+        confirm = QMessageBox.question(
+            self, "Confirm Merge",
+            f"Merge <b>{self._current_pname}</b> → <b>{tgt_name}</b>?<br><br>"
+            "All images and tags will move to the target. "
+            "The source performer will be permanently deleted.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            with self.conn.cursor() as cur:
+                # Move image_performers rows that don't already exist on target
+                cur.execute("""
+                    INSERT INTO image_performers (image_id, performer_id)
+                    SELECT image_id, %s FROM image_performers WHERE performer_id = %s
+                    ON CONFLICT DO NOTHING
+                """, (tgt_id, src_id))
+
+                # Delete source's image_performers
+                cur.execute("DELETE FROM image_performers WHERE performer_id = %s", (src_id,))
+
+                # Merge performer_tags: prefer pinned/manually_added/excluded from either side
+                cur.execute("""
+                    INSERT INTO performer_tags
+                        (performer_id, tag_id, image_count, total_images,
+                         assigned_at, pinned, excluded, manually_added)
+                    SELECT %s, tag_id, image_count, total_images,
+                           assigned_at, pinned, excluded, manually_added
+                    FROM   performer_tags WHERE performer_id = %s
+                    ON CONFLICT (performer_id, tag_id) DO UPDATE
+                        SET pinned         = performer_tags.pinned         OR excluded.pinned,
+                            manually_added = performer_tags.manually_added OR excluded.manually_added,
+                            excluded       = performer_tags.excluded       OR excluded.excluded
+                """, (tgt_id, src_id))
+
+                cur.execute("DELETE FROM performer_tags WHERE performer_id = %s", (src_id,))
+                cur.execute("DELETE FROM performers WHERE id = %s", (src_id,))
+            self.conn.commit()
+
+            self._current_pid   = None
+            self._current_pname = None
+            self.merge_btn.setEnabled(False)
+            self.add_tag_btn.setEnabled(False)
+            self.tag_review_btn.setEnabled(False)
+            self._load_performers()
+
+            # Re-select the target performer
+            for i in range(self.perf_list.count()):
+                if self.perf_list.item(i).data(Qt.ItemDataRole.UserRole) == tgt_id:
+                    self.perf_list.setCurrentRow(i)
+                    break
+        except Exception as e:
+            self.conn.rollback()
+            QMessageBox.critical(self, "Merge Failed", str(e))
 
     # ------------------------------------------------------------------
     # Open Tag Review for current performer

@@ -573,10 +573,16 @@ class SettingsDialog(QDialog):
             "Removes tags that no longer meet the threshold."
         )
         db_assign_performer_tags_button.clicked.connect(self._assign_performer_tags)
+        db_find_dupes_button = QPushButton("Find Duplicates")
+        db_find_dupes_button.setToolTip(
+            "Find images with the same SHA-256 hash (exact duplicates)."
+        )
+        db_find_dupes_button.clicked.connect(self._find_duplicates)
         db_btn_layout3.addWidget(db_run_history_button)
         db_btn_layout3.addWidget(db_find_orphans_button)
         db_btn_layout3.addWidget(db_export_csv_button)
         db_btn_layout3.addWidget(db_assign_performer_tags_button)
+        db_btn_layout3.addWidget(db_find_dupes_button)
         db_btn_layout3.addStretch(1)
 
         db_layout.addLayout(db_host_layout)
@@ -1056,38 +1062,77 @@ class SettingsDialog(QDialog):
 
     def _db_stats(self):
         from . import llmii_db
-        conn = self._get_db_connection()
-        if not conn:
-            return
-        try:
-            stats = llmii_db.get_stats(conn)
-            conn.close()
-        except Exception as e:
-            QMessageBox.critical(self, "Stats Failed", str(e))
-            return
-        top_tags_lines = "\n".join(
-            f"    {i+1}. {tag}  ({count} images)"
-            for i, (tag, count) in enumerate(stats['top_tags'])
-        ) if stats['top_tags'] else "    (none)"
-        msg = (
-            f"Database Statistics\n"
-            f"{'─' * 40}\n"
-            f"Total images:          {stats['total_images']}\n"
-            f"Processed images:      {stats['processed_images']}\n"
-            f"Avg keywords/image:    {stats['avg_keywords']}\n"
-            f"Zero-keyword images:   {stats['zero_keyword_images']}\n"
-            f"Sparse images (1–4):   {stats['sparse_images']}\n"
-            f"\n"
-            f"Unmatched (total):     {stats['total_unmatched']}\n"
-            f"Unmatched (unique):    {stats['unique_unmatched']}\n"
-            f"\n"
-            f"Tagger runs:           {stats['total_runs']}\n"
-            f"Stuck runs:            {stats['stuck_runs']}\n"
-            f"\n"
-            f"Top {len(stats['top_tags'])} tags by image count:\n"
-            f"{top_tags_lines}"
-        )
-        QMessageBox.information(self, "DB Stats", msg)
+        def _show(stats):
+            top_tags_lines = "\n".join(
+                f"    {i+1}. {tag}  ({count} images)"
+                for i, (tag, count) in enumerate(stats['top_tags'])
+            ) if stats['top_tags'] else "    (none)"
+            msg = (
+                f"Database Statistics\n"
+                f"{'─' * 40}\n"
+                f"Total images:          {stats['total_images']}\n"
+                f"Processed images:      {stats['processed_images']}\n"
+                f"Avg keywords/image:    {stats['avg_keywords']}\n"
+                f"Zero-keyword images:   {stats['zero_keyword_images']}\n"
+                f"Sparse images (1–4):   {stats['sparse_images']}\n"
+                f"\n"
+                f"Unmatched (total):     {stats['total_unmatched']}\n"
+                f"Unmatched (unique):    {stats['unique_unmatched']}\n"
+                f"\n"
+                f"Tagger runs:           {stats['total_runs']}\n"
+                f"Stuck runs:            {stats['stuck_runs']}\n"
+                f"\n"
+                f"Top {len(stats['top_tags'])} tags by image count:\n"
+                f"{top_tags_lines}"
+            )
+            QMessageBox.information(self, "DB Stats", msg)
+        self._run_db_async("DB Stats", llmii_db.get_stats, _show)
+
+    def _find_duplicates(self):
+        from . import llmii_db
+        def _show(groups):
+            if not groups:
+                QMessageBox.information(self, "Find Duplicates",
+                    "No duplicate images found (no two images share the same SHA-256 hash).")
+                return
+
+            total_dupes = sum(len(paths) - 1 for _, paths in groups)
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Duplicate Images — {len(groups)} group(s), {total_dupes} extra file(s)")
+            dlg.setMinimumSize(700, 500)
+            lay = QVBoxLayout(dlg)
+
+            info = QLabel(
+                f"<b>{len(groups)}</b> group(s) of identical images found "
+                f"({total_dupes} redundant file(s) beyond the first copy)."
+            )
+            lay.addWidget(info)
+
+            table = QTableWidget()
+            table.setColumnCount(2)
+            table.setHorizontalHeaderLabels(["Path", "SHA-256"])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            table.setAlternatingRowColors(True)
+
+            rows = []
+            for sha, paths in groups:
+                for i, path in enumerate(paths):
+                    rows.append((path, sha if i == 0 else "  ↑ same"))
+            table.setRowCount(len(rows))
+            for r, (path, sha) in enumerate(rows):
+                table.setItem(r, 0, QTableWidgetItem(path))
+                table.setItem(r, 1, QTableWidgetItem(sha))
+
+            lay.addWidget(table, stretch=1)
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dlg.accept)
+            lay.addWidget(close_btn)
+            dlg.exec()
+
+        self._run_db_async("Find Duplicates", llmii_db.find_duplicate_images, _show)
 
     def _db_health_check(self):
         from . import llmii_db

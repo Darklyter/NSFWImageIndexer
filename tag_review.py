@@ -1146,6 +1146,24 @@ class TagReviewWindow(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def keyPressEvent(self, event):
+        """Global shortcuts:
+            Left / Right  — navigate images for the current keyword
+            S / Escape    — skip (when search box does not have focus)
+        """
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self._img_prev()
+            return
+        if key == Qt.Key.Key_Right:
+            self._img_next()
+            return
+        if key in (Qt.Key.Key_S, Qt.Key.Key_Escape):
+            if not self.search.hasFocus():
+                self._skip()
+                return
+        super().keyPressEvent(event)
+
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------

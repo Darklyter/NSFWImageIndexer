@@ -1767,6 +1767,24 @@ def export_keywords_csv(conn, output_path):
     return len(image_data)
 
 
+def find_duplicate_images(conn):
+    """Return a list of duplicate groups: [(sha256, [path, ...]), ...]
+    sorted by group size descending.  Only groups with 2+ images are returned.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT sha256, array_agg(path ORDER BY path) AS paths
+            FROM   {_SCHEMA}.images
+            WHERE  sha256 IS NOT NULL
+            GROUP  BY sha256
+            HAVING COUNT(*) > 1
+            ORDER  BY COUNT(*) DESC, sha256
+            """
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
 def get_processed_paths(conn, directory_prefix=None):
     """Return a set of normalised file paths that have been successfully processed.
 
