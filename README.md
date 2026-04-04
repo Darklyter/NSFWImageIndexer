@@ -23,7 +23,7 @@ The first time you launch the tool you will be presented with a list of AI model
 - **Completely Automatic Backend Configuration**: The AI backend (KoboldCpp) will be downloaded and configured with optimal settings
 - **GPU Acceleration**: Will use Apple Metal, Nvidia CUDA, or AMD (Vulkan) hardware if available to greatly speed inference
 - **Cross-Platform**: Supports Windows, macOS ARM, and Linux
-- **Stop and Start Capability**: Can stop and start without having to reprocess all the files again
+- **Stop and Start Capability**: Can stop and start without having to reprocess all the files again. Use **Resume Session** to skip already-completed files via the database or a saved checkpoint file
 - **One or Two Step Processing**: Can do keywords and a simple caption in one step, or keywords and a detailed caption in two steps
 - **Highly Configurable**: You are in control of everything
 - **Multiple Models**: You can choose a different model and run it again for additional keywords
@@ -263,6 +263,10 @@ Run `python tag_review.py` to open a GUI for reviewing unmatched keywords. For e
 keyword the tool shows a sample image, the LLM caption, and fuzzy near-miss suggestions.
 You can assign keywords to canonical tags (which adds an alias) or create new tags.
 
+- **◄ Prev / Next ►** — step through all images associated with the current keyword
+- **Keyboard shortcuts** — `Left`/`Right` arrow keys navigate images; `S` or `Escape`
+  skips the keyword (when the search box is not focused)
+
 Pass `--performer "Name"` to filter the review queue to images for a specific performer:
 ```
 python tag_review.py --performer "Jane Doe"
@@ -277,9 +281,15 @@ that appear on their images but are not yet directly assigned.
 - **Left-click a tag chip** — no action (read-only display)
 - **Right-click a tag chip** — Pin (lock it so auto-reassignment can't remove it),
   Remove for this performer, or Blacklist for all performers
+- **Double-click a tag chip** — remove it from the current performer
 - **Add Tag** — manually assign any tag from the vocabulary to the current performer
+- **Merge…** — merge the current performer record into another, combining their images and tags
 - **Tag Review** — open `tag_review.py` filtered to the current performer's images
-- Right-click any tag in the **All Image Tags** pane to attach it directly
+- The performer list shows a `(processed/total)` image count column
+- **All Image Tags pane** — tags on this performer's images not yet directly assigned,
+  sorted by frequency (Count) or alphabetically (A-Z) using the toggle buttons
+- **Double-click** any tag in the All Image Tags pane to attach it directly
+- **Right-click** any tag in the All Image Tags pane to attach it via context menu
 
 ### Database Maintenance Buttons (in Settings)
 
@@ -291,6 +301,7 @@ that appear on their images but are not yet directly assigned.
 | Promote Aliased Unmatched | Move unmatched keywords that now have aliases to the keywords table |
 | DB Stats | Show image coverage, keyword counts, and top tags |
 | Health Check | Find stuck runs and promotable unmatched keywords |
+| Find Duplicates | List images sharing the same SHA-256 hash (exact duplicates) |
 
 ---
 

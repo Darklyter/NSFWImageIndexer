@@ -5,6 +5,8 @@ import shutil
 import base64
 import requests
 
+_MAX_HISTORY = 200  # max images retained in preview history
+
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize, QRect, QPoint
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                            QLabel, QLineEdit, QCheckBox, QPushButton, QFileDialog,
@@ -2044,6 +2046,7 @@ class ImageIndexerGUI(QMainWindow):
         log_layout.addWidget(log_label)
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
+        self.output_area.document().setMaximumBlockCount(2000)
         log_layout.addWidget(self.output_area)
         
         log_frame.setMinimumHeight(GuiConfig.LOG_HEIGHT)
@@ -2057,6 +2060,7 @@ class ImageIndexerGUI(QMainWindow):
         self.previous_filename = None
         self.pause_handler = PauseHandler()
         self.api_check_thread = None
+        self.indexer_thread = None
         self.api_is_ready = False
         self.run_button.setEnabled(False)
         self.image_history = []  # [(base64_image, caption, keywords, filename)]
@@ -2135,8 +2139,13 @@ class ImageIndexerGUI(QMainWindow):
         if performers is None:
             performers = []
 
-        # Add to history
+        # Add to history, keeping only the last _MAX_HISTORY entries
         self.image_history.append((base64_image, caption, keywords, raw_keywords, debug_map, filename, studio, performers))
+        if len(self.image_history) > _MAX_HISTORY:
+            trim = len(self.image_history) - _MAX_HISTORY
+            del self.image_history[:trim]
+            if self.current_position != -1:
+                self.current_position = max(0, self.current_position - trim)
 
         # If user was viewing the most recent image (or this is the first image),
         # update current_position to point to the new image
@@ -2402,6 +2411,15 @@ class ImageIndexerGUI(QMainWindow):
                         folders.append(folder)
             config.skip_folders = folders
 
+        if self.indexer_thread is not None:
+            try:
+                self.indexer_thread.output_received.disconnect()
+                self.indexer_thread.image_processed.disconnect()
+                self.indexer_thread.progress_update.disconnect()
+                self.indexer_thread.finished.disconnect()
+            except Exception:
+                pass
+
         self.indexer_thread = IndexerThread(config)
         self.indexer_thread.output_received.connect(self.update_output)
         self.indexer_thread.image_processed.connect(self.update_image_preview)
@@ -2461,6 +2479,10 @@ class ImageIndexerGUI(QMainWindow):
         self.stop_button.setEnabled(False)
         self.pause_button.setText("Pause")
         self.progress_widget.setVisible(False)
+        if self.indexer_thread is not None:
+            self.indexer_thread.quit()
+            self.indexer_thread.wait()
+            self.indexer_thread = None
 
     def update_progress_bars(self, data):
         """Update the three progress bars from a 'progress' callback dict."""
