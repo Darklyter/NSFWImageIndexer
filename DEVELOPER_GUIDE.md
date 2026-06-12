@@ -5,6 +5,18 @@
 > continue development without needing to rediscover anything from scratch.
 >
 > **State captured**: March 2026 (updated with performer_tags table, explore_performers.py tool, tag_review --performer filter, and performer tag management functions).
+>
+> **June 2026 remediation**: ~110 review findings were fixed on branch
+> `fix/code-review-2026-06` — see `FIX_PLAN.md` for the item-by-item list.
+> Notable behavior changes this guide may not yet reflect: JSON sidecars are
+> extension-preserving (`photo.jpg.json`; legacy `photo.json` still read);
+> zip-image sidecars persist in `<zipstem>.sidecars/` next to the zip;
+> zip extraction uses `<temp>/llmii_zip_extract/`; reprocessing replaces
+> keywords image-wide unless update_keywords is set; keyword_count uses
+> COUNT(DISTINCT tag_id); images.sha256 is populated (UNIQUE dropped);
+> tagger_runs records success/cancelled/failed truthfully; the 'invalid'
+> status is persisted; Stop unwinds via llmii.StopProcessing; dry_run is
+> fully non-mutating; EXIF orientation is applied before VLM submission.
 
 ---
 

@@ -219,7 +219,7 @@ Samplers affect the tokens that the AI can choose from every time it generates a
 
 **No backups:** Don't create backups of existing metadata before modifying. By default there will be a file created with an `_original` label for each altered image, so if you don't want that then check this box.
 
-**Pretend mode:** Simulate processing without making any changes.
+**Pretend mode:** Simulate processing without making any changes — no metadata writes, no file renames, no backup deletions.
 
 **No file validation:** If checked, files will not be checked for metadata errors.
 
@@ -320,7 +320,7 @@ that appear on their images but are not yet directly assigned.
 | Promote Aliased Unmatched | Move unmatched keywords that now have aliases to the keywords table |
 | DB Stats | Show image coverage, keyword counts, and top tags |
 | Health Check | Find stuck runs and promotable unmatched keywords |
-| Find Duplicates | List images sharing the same SHA-256 hash (exact duplicates) |
+| Find Duplicates | List images sharing the same SHA-256 hash (exact duplicates). Hashes are recorded as images are processed; rows written by older versions gain a hash on reprocess |
 
 ---
 
