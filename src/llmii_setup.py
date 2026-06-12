@@ -110,17 +110,22 @@ class GpuDetector:
                 # device in no fixed count).
                 vulkan_devices = []
                 current = None
+                pending_type = None
                 for line in output.splitlines():
-                    if "deviceName" in line and "=" in line:
+                    if "deviceType" in line and "=" in line:
+                        # deviceType precedes deviceName within a block, so
+                        # buffer it for the device created next (assigning
+                        # it to `current` mislabeled the PREVIOUS card).
+                        pending_type = "DISCRETE" in line.split("=", 1)[1]
+                    elif "deviceName" in line and "=" in line:
                         if current is not None:
                             vulkan_devices.append(current)
                         current = {
                             "name": line.split("=", 1)[1].strip(),
-                            "is_discrete": False,
+                            "is_discrete": bool(pending_type),
                             "vram_mb": 0,
                         }
-                    elif current is not None and "deviceType" in line and "=" in line:
-                        current["is_discrete"] = "DISCRETE" in line.split("=", 1)[1]
+                        pending_type = None
                     elif current is not None and "heapSize" in line and "0x" in line:
                         try:
                             hex_value = line.split("0x")[1].split()[0]
