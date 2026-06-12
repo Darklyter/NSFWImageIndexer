@@ -957,9 +957,13 @@ def load_tags_from_file(conn, json_path, progress_callback=None):
 def assign_performer_tags(conn, performer_id=None):
     """Assign canonical tags to performers based on statistical prevalence.
 
-    For each performer that has at least one processed image, finds all tags
-    that appear on more than 40% of that performer's images and upserts rows
-    into performer_tags.  Rows that no longer meet the threshold are removed,
+    Only SINGLE-performer images count: a tag on an image with two or more
+    performers can't be attributed to a specific person, so those images are
+    excluded from both the per-performer image total and the per-tag counts.
+
+    For each performer that has at least one single-performer image, finds all
+    tags that appear on more than 40% of those images and upserts rows into
+    performer_tags.  Rows that no longer meet the threshold are removed,
     except those that are pinned, manually added, or marked as excluded
     (excluded rows are tombstones that prevent auto-reassignment).
 
@@ -978,30 +982,40 @@ def assign_performer_tags(conn, performer_id=None):
     assigned = 0
     removed = 0
 
+    # Restricts an image_performers row (aliased ip) to images that have
+    # exactly one performer.
+    _SOLO = """NOT EXISTS (
+                   SELECT 1 FROM image_performers ip2
+                   WHERE ip2.image_id = ip.image_id
+                     AND ip2.performer_id <> ip.performer_id
+               )"""
+
     with conn.cursor() as cur:
-        # All performers with at least one image in image_performers
+        # Performers with at least one SINGLE-performer image
         # (or just the requested one)
-        cur.execute("""
+        cur.execute(f"""
             SELECT p.id, COUNT(ip.image_id) AS total
             FROM   performers p
             JOIN   image_performers ip ON ip.performer_id = p.id
             WHERE  (%s::int IS NULL OR p.id = %s)
+              AND  {_SOLO}
             GROUP  BY p.id
             HAVING COUNT(ip.image_id) > 0
         """, (performer_id, performer_id))
         performers = cur.fetchall()
 
         for performer_id, total_images in performers:
-            # Tags on more than 40% of this performer's images.
+            # Tags on more than 40% of this performer's single-performer images.
             # count * 5 > total * 2  ⟺  count/total > 2/5 = 0.40  (avoids float division)
             # Skip globally excluded tags.
-            cur.execute("""
+            cur.execute(f"""
                 SELECT ik.tag_id, COUNT(DISTINCT ik.image_id) AS tag_count
                 FROM   image_performers ip
                 JOIN   image_keywords   ik ON ik.image_id = ip.image_id
                 JOIN   tags             t  ON t.id = ik.tag_id
                 WHERE  ip.performer_id = %s
                   AND  NOT t.exclude_from_performers
+                  AND  {_SOLO}
                 GROUP  BY ik.tag_id
                 HAVING COUNT(DISTINCT ik.image_id) * 5 > %s * 2
             """, (performer_id, total_images))
