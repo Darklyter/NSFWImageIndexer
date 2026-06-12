@@ -15,13 +15,15 @@ def split_on_internal_capital(word):
             BlueSky -> Blue Sky
             microService -> micro Service
     """
-    if len(word) <= 4:
+    # ALL-CAPS words (BLONDE, LINGERIE) have capitals everywhere — splitting
+    # them produces garbage like 'BLON DE'.
+    if len(word) <= 4 or word.isupper():
         return word
-    
+
     for i in range(4, len(word)):
         if word[i].isupper():
             return word[:i] + " " + word[i:]
-            
+
     return word
 
 def normalize_keyword(keyword, banned_words, config=None):
@@ -107,44 +109,55 @@ def normalize_keyword(keyword, banned_words, config=None):
         else:
             words.append(token)
     
-    # Validate word count if limit_word_count is enabled
+    # Validate word count if limit_word_count is enabled.
+    # The documented allowance is max_words + 1 ONLY for and/or compounds
+    # ("salt and pepper"); plain keywords get max_words.
     if config.limit_word_count:
         max_words = config.max_words_per_keyword
-        if len(words) > max_words + 1:
+        allowed = max_words + 1 if any(w in ('and', 'or') for w in words) else max_words
+        if len(words) > allowed:
             return None
-        
+
     # Handle and/or splitting if enabled
-    if config.split_and_entries and len(words) == 3 and words[1] in ['and', 'or']:
-        if ' '.join(words) in AND_EXCEPTIONS:
-            pass
+    already_depluralized = False
+    is_exception_phrase = ' '.join(words) in AND_EXCEPTIONS
+    if (config.split_and_entries and len(words) == 3
+            and words[1] in ['and', 'or'] and not is_exception_phrase):
+        # Remove and/or and make singular if depluralize_keywords is enabled
+        if config.depluralize_keywords:
+            tokens = [de_pluralize(words[0]), de_pluralize(words[2])]
+            already_depluralized = True
         else:
-            # Remove and/or and make singular if depluralize_keywords is enabled
-            if config.depluralize_keywords:
-                tokens = [de_pluralize(words[0]), de_pluralize(words[2])]
-            else:
-                tokens = [words[0], words[2]]
-    
-    # Word validation
-    for word in words:
-        
-        # Check minimum length if enabled
-        if config.min_word_length:
-            if len(word) < 2 and word not in ['x', 'u']:
+            tokens = [words[0], words[2]]
+
+    # Word validation: minimum length applies to whole tokens, not the
+    # hyphen-split parts (otherwise t-shirt / v-neck / a-line are rejected
+    # for their single-letter prefix).
+    if config.min_word_length:
+        for token in tokens:
+            if '-' in token:
+                continue
+            if len(token) < 2 and token not in ['x', 'u']:
                 return None
-        
+
     # Check if starts with 3+ digits if enabled
     if config.no_digits_start and words and re.match(r'^\d{3,}', words[0]):
         return None
-    
-    # Make words singular if depluralize_keywords is enabled
-    if config.depluralize_keywords:
-        # Make solo words singular
-        if len(words) == 1:
-            tokens = [de_pluralize(words[0])]
-        # If two or more words make the last word singular
+
+    # Make words singular if depluralize_keywords is enabled.
+    # Skip when the and/or branch already depluralized both halves (running
+    # de_pluralize twice corrupts s-ending singulars: buses->bus->bu), and
+    # skip AND_EXCEPTIONS idioms entirely ('facts and figures' must not
+    # become 'facts and figure').
+    if config.depluralize_keywords and not already_depluralized and not is_exception_phrase:
+        # Branch on tokens (the returned structure): a single hyphenated
+        # token like 'ice-creams' previously fell between the two branches
+        # and was never depluralized.
+        if len(tokens) == 1:
+            tokens = [de_pluralize(tokens[0])]
         elif len(tokens) > 1:
             tokens[-1] = de_pluralize(tokens[-1])
-    
+
     # Return the original tokens (preserving hyphens)
     return ' '.join(tokens)
     
@@ -165,10 +178,15 @@ def clean_string(data):
         # Remove any remaining orphaned closing tags
         data = re.sub(r'</think>', '', data)
         
-        # Normalize
-        data = re.sub(r"\n", "", data)
-        data = re.sub(r'["""]', '"', data)
+        # Normalize. Newlines become spaces (deleting them glued words
+        # together: "line one\nline two" -> "oneline"); curly quotes become
+        # straight ones (the old class was three literal straight quotes —
+        # a no-op).
+        data = re.sub(r"\n", " ", data)
+        data = re.sub(r"“|”|″", '"', data)
+        data = re.sub(r"‘|’", "'", data)
         data = re.sub(r"\\{2}", "", data)
+        data = re.sub(r"  +", " ", data)
         last_period = data.rfind('.')
         
         if last_period != -1:
@@ -184,7 +202,11 @@ def markdown_list_to_dict(text):
         list, and if one is found, converts it to
         a dict.
     """
-    list_pattern = r"(?:^\s*[-*+]|\d+\.)\s*(.+)$"
+    # ^ must anchor BOTH alternatives: with the old precedence the \d+\.
+    # branch matched anywhere in a line, so ordinary prose containing a
+    # number ("She looks about 25. The lighting is soft") produced fake
+    # keywords from the text after the digits.
+    list_pattern = r"^\s*(?:[-*+]|\d+\.)\s*(.+)$"
     list_items = re.findall(list_pattern, text, re.MULTILINE)
 
     if list_items:
@@ -277,6 +299,30 @@ def clean_json(data):
 
     return None
 
+def _coerce_keyword_list(keywords):
+    """Coerce a model-supplied Keywords value into a clean list of strings.
+
+    Models sometimes return a comma-joined STRING instead of an array —
+    extending with it explodes the string into single characters — or mix
+    numbers/nulls/dicts into the list, which crashes string operations
+    downstream and wastes the whole generation on a retry.
+    """
+    if keywords is None:
+        return []
+    if isinstance(keywords, str):
+        return [p.strip() for p in re.split(r'[,;]', keywords) if p.strip()]
+    if isinstance(keywords, (list, tuple, set)):
+        out = []
+        for item in keywords:
+            if isinstance(item, str):
+                if item.strip():
+                    out.append(item.strip())
+            elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                out.append(str(item))
+        return out
+    return []
+
+
 def clean_tags(data):
     """ Extract and combine all Keywords entries from LLM output.
         When EOS token is banned, the model may generate multiple
@@ -292,21 +338,24 @@ def clean_tags(data):
 
     if isinstance(data, dict):
         # Single dict - extract Keywords if present
-        keywords = data.get("Keywords", [])
+        keywords = _coerce_keyword_list(data.get("Keywords", []))
         if keywords:
             all_keywords.extend(keywords)
         return {"Keywords": all_keywords} if all_keywords else None
 
     if isinstance(data, list):
-        # Raw string list - model returned keywords directly as an array
-        if data and all(isinstance(item, str) for item in data):
-            seen = set()
-            deduped = [k for k in data if not (k.lower() in seen or seen.add(k.lower()))][:30]
-            return {"Keywords": deduped}
+        # Raw list - model returned keywords directly as an array
+        if data and not any(isinstance(item, dict) for item in data):
+            coerced = _coerce_keyword_list(data)
+            if coerced:
+                seen = set()
+                deduped = [k for k in coerced if not (k.lower() in seen or seen.add(k.lower()))][:30]
+                return {"Keywords": deduped}
+            return None
         # List of dicts - extract Keywords from each
         for item in data:
             if isinstance(item, dict):
-                keywords = item.get("Keywords", [])
+                keywords = _coerce_keyword_list(item.get("Keywords", []))
                 if keywords:
                     all_keywords.extend(keywords)
         return {"Keywords": all_keywords} if all_keywords else None
@@ -342,14 +391,14 @@ def clean_tags(data):
                 array_str = '[' + match + ']'
                 keywords = json.loads(array_str)
                 if keywords:
-                    all_keywords.extend(keywords)
+                    all_keywords.extend(_coerce_keyword_list(keywords))
             except:
                 # If parsing fails, try with repair_json
                 try:
                     array_str = '[' + match + ']'
                     keywords = json.loads(rj(array_str))
                     if keywords:
-                        all_keywords.extend(keywords)
+                        all_keywords.extend(_coerce_keyword_list(keywords))
                 except:
                     pass
 
@@ -848,6 +897,15 @@ class LLMProcessor:
         self.use_json_grammar = config.use_json_grammar
         self.lm_studio = config.lm_studio
         self.lm_studio_model = config.lm_studio_model
+        if self.lm_studio and not (self.lm_studio_model or '').strip():
+            # Fail fast with a clear message: LM Studio requires a model
+            # name, and without one every request would 400 and surface
+            # only as an endless stream of per-image retries.
+            raise ValueError(
+                "LM Studio is enabled but no model name is set. "
+                "Enter the model identifier shown in LM Studio "
+                "(Settings → LM Studio → Model)."
+            )
         self.api_url = config.lm_studio_url if config.lm_studio else config.api_url
         if config.lm_studio:
             self.max_tokens = config.lm_studio_gen_count
@@ -921,6 +979,10 @@ class LLMProcessor:
                 "messages": messages,
                 "max_tokens": self.max_tokens,
                 "temperature": self.temperature,
+                # top_k/min_p are vendor extensions (not OpenAI-standard) but
+                # both KoboldCpp and LM Studio document and apply them, and
+                # the LM Studio sampler settings in the GUI configure them —
+                # kept in the shared payload deliberately.
                 "top_p": self.top_p,
                 "top_k": self.top_k,
                 "min_p": self.min_p,
@@ -929,8 +991,7 @@ class LLMProcessor:
             if self.lm_studio:
                 # LM Studio uses OpenAI-standard repetition_penalty
                 payload["repetition_penalty"] = self.rep_pen
-                if self.lm_studio_model:
-                    payload["model"] = self.lm_studio_model
+                payload["model"] = self.lm_studio_model
             else:
                 # KoboldCpp-specific params
                 payload["rep_pen"] = self.rep_pen
@@ -994,8 +1055,11 @@ class LLMProcessor:
                             "required": ["Description", "Keywords"]
                         }
                     }
-                elif task == "keywords":
-                    # KoboldCpp schema for keywords only
+                elif task in ("keywords", "keywords_from_text"):
+                    # KoboldCpp schema for keywords only. keywords_from_text
+                    # (stage 2 of the detailed-caption pipeline) uses the
+                    # same shape — it was listed in the outer condition but
+                    # fell through both branches and ran unconstrained.
                     payload["response_format"] = {
                         "type": "json_object",
                         "schema": {
@@ -1030,23 +1094,46 @@ class LLMProcessor:
             response_json = response.json()
 
             if "choices" in response_json and len(response_json["choices"]) > 0:
+                from_validated_fallback = False
                 if "message" in response_json["choices"][0]:
                     msg = response_json["choices"][0]["message"]
                     content = msg.get("content") or ""
-                    # Reasoning models (e.g. Qwen3) put structured output into
-                    # reasoning_content when json_schema is active and leave
-                    # content empty — fall back to reasoning_content in that case.
                     if not content.strip():
-                        content = msg.get("reasoning_content") or ""
+                        # Some reasoning-parser configs emit the final answer
+                        # in reasoning_content and leave content empty. But
+                        # that field can equally be raw chain-of-thought, so:
+                        # strip <think> blocks, and for structured tasks only
+                        # accept it when it actually parses as JSON —
+                        # otherwise CoT prose would be mined for keywords.
+                        fallback = msg.get("reasoning_content") or ""
+                        fallback = re.sub(r'<think>.*?</think>', '', fallback, flags=re.DOTALL)
+                        fallback = fallback.replace('<think>', '').replace('</think>', '').strip()
+                        if task in ("caption_and_keywords", "keywords", "keywords_from_text"):
+                            try:
+                                parsed = json.loads(rj(fallback))
+                                valid = isinstance(parsed, (dict, list))
+                            except Exception:
+                                valid = False
+                            if valid:
+                                content = fallback
+                                from_validated_fallback = True
+                            else:
+                                print("  Empty content; reasoning_content is not valid JSON — will retry")
+                                return None
+                        else:
+                            content = fallback
                 else:
                     content = response_json["choices"][0].get("text", "")
-                # Detect degenerate looping output (same word repeated >60% of tokens)
-                words = content.split()
-                if len(words) >= 10:
-                    most_common = max(set(words), key=words.count)
-                    if words.count(most_common) / len(words) > 0.6:
-                        print(f"  Degenerate output ('{most_common}' repeated {words.count(most_common)}x) — will retry")
-                        return None
+                # Detect degenerate looping output (same word repeated >60% of
+                # tokens). Skipped for validated-JSON fallbacks — legitimate
+                # keyword arrays repeat structural tokens.
+                if not from_validated_fallback:
+                    words = content.split()
+                    if len(words) >= 10:
+                        most_common = max(set(words), key=words.count)
+                        if words.count(most_common) / len(words) > 0.6:
+                            print(f"  Degenerate output ('{most_common}' repeated {words.count(most_common)}x) — will retry")
+                            return None
                 return content
             print(f"  Warning: API response missing expected data")
             return None
@@ -2539,6 +2626,7 @@ class FileProcessor:
         caption = None
         keywords = None
         detailed_caption = ""
+        generated_caption = ""   # raw NEW caption text for caption-based tag extraction
         old_keywords = metadata.get("MWG:Keywords", [])
         file_path = metadata["SourceFile"]
         
@@ -2548,9 +2636,10 @@ class FileProcessor:
             if not self.config.no_caption and self.config.detailed_caption:
                 # Stage 1: image → verbose description
                 detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))
+                generated_caption = detailed_caption or ""
 
                 if existing_caption and self.config.update_caption:
-                    caption = existing_caption + "<generated>" + detailed_caption + "</generated>"
+                    caption = existing_caption + "<generated>" + generated_caption + "</generated>"
                 else:
                     caption = detailed_caption
 
@@ -2576,12 +2665,17 @@ class FileProcessor:
                          
                 if isinstance(data, dict):
                     keywords = data.get("Keywords")
+                    # Description may be absent (no_caption mode, or the
+                    # model omitted it): never concatenate None into the
+                    # caption string — the TypeError used to discard the
+                    # valid keywords and force a pointless retry.
+                    generated_caption = data.get("Description") or ""
 
                     if not existing_caption and not self.config.no_caption:
                         caption = data.get("Description")
 
                     elif existing_caption and self.config.update_caption:
-                        caption = existing_caption + "<generated>" + data.get("Description") + "</generated>"
+                        caption = existing_caption + "<generated>" + generated_caption + "</generated>"
 
                     elif data.get("Description") and not self.config.no_caption:
                         caption = data.get("Description")
@@ -2606,7 +2700,10 @@ class FileProcessor:
             else:
                 status = "success"
                 raw_keywords = list(keywords)
-                keywords, debug_map = self.process_keywords(metadata, keywords, return_debug=True)
+                keywords, debug_map = self.process_keywords(
+                    metadata, keywords, return_debug=True,
+                    caption=generated_caption,
+                )
                 _G = '\033[32m'   # green       = matched
                 _Y = '\033[33m'   # dark yellow = blacklisted
                 _R = '\033[31m'   # red         = unmatched
@@ -2752,12 +2849,18 @@ class FileProcessor:
 
         return success
     
-    def process_keywords(self, metadata, new_keywords, return_debug=False):
+    def process_keywords(self, metadata, new_keywords, return_debug=False,
+                         caption=None):
         """ Normalize extracted keywords and deduplicate them.
             If update is configured, combine the old and new keywords.
             When a TagMatcher is active, each keyword is matched against the tag
             vocabulary: matched keywords are replaced with the canonical tag;
             unmatched keywords are discarded and logged.
+
+            caption — the freshly GENERATED caption text for caption-based
+            tag extraction. When None, falls back to the metadata dict's
+            MWG:Description (which on a fresh image is empty — the old code
+            always read it from there and the extraction silently never ran).
 
             When return_debug=True, returns (keywords, debug_map) where
             debug_map maps each raw new_keyword to its resolved tag or None.
@@ -2804,9 +2907,6 @@ class FileProcessor:
             # e.g. "dark red hair" to be rewritten to "dark and red hair", which then
             # failed to match the alias "dark red hair" in the database.
         })
-        # Regex to detect a hair colour keyword (ends in "hair", contains a colour)
-        _MULTI_HAIR_RE = re.compile(r'\bhair\b', re.I)
-
         # Colours that only occur in dyed/unnatural hair.
         # Natural colours (black, brown, blonde, auburn, red, gray, etc.) are
         # intentionally absent so they continue to resolve via the normal alias lookup.
@@ -2876,7 +2976,8 @@ class FileProcessor:
         # canonical "Piercing - Location" form.  Ordered specific → general.
         _PIERCING_LOCATIONS = [
             (re.compile(r'\bnipple', re.I),                  'Nipple'),
-            (re.compile(r'\bbelly\s+button|navel', re.I),    'Navel'),
+            # 'belly' alone covers 'belly ring' / 'belly piercing' too
+            (re.compile(r'\bbelly|navel', re.I),             'Navel'),
             (re.compile(r'\bseptum', re.I),                  'Septum'),
             (re.compile(r'\bnostril|nose\b', re.I),          'Nose'),
             (re.compile(r'\btongue', re.I),                  'Tongue'),
@@ -2887,12 +2988,11 @@ class FileProcessor:
             (re.compile(r'\bindustrial', re.I),              'Industrial'),
             (re.compile(r'\bhelix|tragus|daith|rook|conch', re.I), 'Ear'),
             (re.compile(r'\bear\b|earring', re.I),           'Ear'),
-            (re.compile(r'\bnavel|belly', re.I),             'Navel'),
             (re.compile(r'\bcollarbone|clavicle', re.I),     'Collarbone'),
-            (re.compile(r'\bneck', re.I),                    'Neck'),
+            # \b after neck: 'necklace' is jewellery, not a neck piercing
+            (re.compile(r'\bneck\b', re.I),                  'Neck'),
             (re.compile(r'\bbrow|forehead', re.I),           'Eyebrow'),
-            (re.compile(r'\bfinger', re.I),                  'Finger'),
-            (re.compile(r'\bnavel', re.I),                   'Navel'),
+            # NOTE: no 'finger' entry — finger rings are jewellery, not piercings
         ]
 
         def _normalize_piercing(kw: str):
@@ -3007,11 +3107,26 @@ class FileProcessor:
              'Bottomless'),
         ]
 
+        # 'nude'/'naked' used as a COLOR or style adjective before garments
+        # and cosmetics ("nude stockings", "nude lipstick") — these describe
+        # a fully-clothed subject and must not produce the 'Nude' tag.
+        # ('nude' is even listed in _COLOR_WORDS below.)
+        _NUDE_COLOR_USE_RE = re.compile(
+            r'\b(nude|naked)\s+(stockings?|pantyhose|tights|nylons?|heels?|pumps?|'
+            r'shoes?|sandals?|boots?|flats|lipsticks?|lips?|nails?|polish|makeup|'
+            r'gloss|eyeshadow|bras?|panties|underwear|lingerie|dress(es)?|'
+            r'bodysuits?|leotards?|tops?|bikinis?|swimsuits?|gowns?|skirts?|'
+            r'shades?|tones?|colors?|colours?|palettes?)\b', re.I)
+
         def _normalize_nudity(kw: str):
             """Map nudity-level descriptions to canonical tags.
             Returns the canonical tag string, or None if the keyword doesn't
             describe a nudity level."""
             k = kw.lower().strip()
+            # Blank out color-usage phrases first so the bare nude/naked
+            # rule can't fire on them; genuine nudity mentions elsewhere in
+            # the keyword ('nude woman in nude heels') still match.
+            k = _NUDE_COLOR_USE_RE.sub(' ', k)
             for pattern, canonical in _NUDITY_RULES:
                 if pattern.search(k):
                     return canonical
@@ -3162,9 +3277,20 @@ class FileProcessor:
                     return _BLACKLISTED
                 return colored_hair_tag
 
+            _matcher_active = (self.tag_matcher.enabled
+                               or self.tag_matcher_fallback.enabled)
+
             # Normalize piercing keywords to "Piercing - Location" form.
             piercing_normalized = _normalize_piercing(keyword)
             if piercing_normalized:
+                if blacklist and any(b in piercing_normalized.lower() for b in blacklist):
+                    return _BLACKLISTED
+                # With a matcher: rewrite and let the alias lookup resolve it.
+                # Without one: return directly — normalize_keyword would
+                # destroy the ' - ' form (its standalone '-' token fails the
+                # hyphen validation and the whole keyword was discarded).
+                if not _matcher_active:
+                    return piercing_normalized
                 keyword = piercing_normalized
 
             # Normalize tattoo location keywords to canonical "Tattoo - Location" form.
@@ -3172,6 +3298,10 @@ class FileProcessor:
             # against the tag file (and colour-stripping is skipped for tattoo terms).
             tattoo_normalized = _normalize_tattoo(keyword)
             if tattoo_normalized:
+                if blacklist and any(b in tattoo_normalized.lower() for b in blacklist):
+                    return _BLACKLISTED
+                if not _matcher_active:
+                    return tattoo_normalized
                 keyword = tattoo_normalized
 
             # Normalize nudity-level keywords to canonical forms ("Nude", "Topless", …).
@@ -3227,7 +3357,28 @@ class FileProcessor:
                     return tag
                 self.tag_matcher.log_unmatched(keyword)
                 return None
-            return normalize_keyword(keyword, self.banned_words, self.config)
+            # No tag matcher active: plain normalization, with the same
+            # blacklist enforcement the matcher path applies.
+            result = normalize_keyword(keyword, self.banned_words, self.config)
+            if result and blacklist and any(b in result.lower() for b in blacklist):
+                return _BLACKLISTED
+            return result
+
+        def _expand_and_or(keywords):
+            """Split 'X and Y' / 'X or Y' keywords into separate keywords
+            (the documented split_and_entries behavior), keeping idioms in
+            AND_EXCEPTIONS whole."""
+            if not getattr(self.config, 'split_and_entries', False):
+                return list(keywords)
+            out = []
+            for kw in keywords:
+                parts = kw.strip().split()
+                if (len(parts) == 3 and parts[1].lower() in ('and', 'or')
+                        and ' '.join(p.lower() for p in parts) not in AND_EXCEPTIONS):
+                    out.extend([parts[0], parts[2]])
+                else:
+                    out.append(kw)
+            return out
 
         if self.config.update_keywords:
             existing_keywords = metadata.get("MWG:Keywords", [])
@@ -3235,13 +3386,13 @@ class FileProcessor:
             if isinstance(existing_keywords, str):
                 existing_keywords = [k.strip() for k in existing_keywords.split(",")]
 
-            for keyword in existing_keywords:
+            for keyword in _expand_and_or(_coerce_keyword_list(existing_keywords)):
                 resolved = _resolve(keyword)
                 if resolved and resolved is not _BLACKLISTED:
                     all_keywords.add(resolved)
 
         debug_map = {}
-        for keyword in new_keywords:
+        for keyword in _expand_and_or(_coerce_keyword_list(new_keywords)):
             resolved = _resolve(keyword)
             debug_map[keyword] = resolved
             if resolved and resolved is not _BLACKLISTED:
@@ -3252,18 +3403,31 @@ class FileProcessor:
         # but not emitted as discrete keywords.  Each sentence is checked
         # individually; sentences containing negations are skipped to avoid
         # false positives like "she is not nude".
-        _caption = (metadata.get('MWG:Description') or '').strip()
+        # Prefer the freshly generated caption passed by the caller; the
+        # metadata fallback only carries a caption from a PREVIOUS run.
+        if caption is not None:
+            _caption = caption.strip()
+        else:
+            _caption = (metadata.get('MWG:Description') or '').strip()
         if _caption:
             _SENT_SPLIT_RE = re.compile(r'[.!?]+')
             _NEG_SENT_RE   = re.compile(
                 r'\b(not|no|without|isn\'t|aren\'t|doesn\'t|don\'t|never)\b', re.I
             )
+            # Nudity terms in free prose need a human subject nearby —
+            # "the wall is painted a nude shade" must not tag the image
+            # 'Nude'. Pubic/labia normalizers are already anatomy-gated.
+            _SUBJ_RE = re.compile(
+                r"\b(she|he|they|her|his|woman|man|girl|guy|lady|female|male|"
+                r"person|model|subject|body)\b", re.I)
             for _sent in _SENT_SPLIT_RE.split(_caption):
                 _sent = _sent.strip()
                 if not _sent or _NEG_SENT_RE.search(_sent):
                     continue
                 for _fn in (_normalize_nudity, _normalize_pubic_hair, _normalize_labia):
                     _canon = _fn(_sent)
+                    if _canon and _fn is _normalize_nudity and not _SUBJ_RE.search(_sent):
+                        continue
                     if _canon and not (blacklist and any(b in _canon.lower() for b in blacklist)):
                         all_keywords.add(_canon)
 
