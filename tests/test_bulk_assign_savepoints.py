@@ -46,6 +46,10 @@ class FakeCursor:
         if s.startswith("SELECT id FROM tags"):
             self._select_result = (42,)
             return
+        if s.startswith("SELECT t.tag FROM tag_aliases"):
+            # No pre-existing alias conflicts in this scenario
+            self._select_result = None
+            return
         kw = params[-1] if params else None
         if kw in self.fail_keywords and "INSERT INTO image_keywords " in s:
             raise RuntimeError("simulated insert failure")
