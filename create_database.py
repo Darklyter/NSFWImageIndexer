@@ -178,7 +178,8 @@ _DDL = [
     (
         "Trigger: trg_images_set_updated_at",
         """
-        CREATE OR REPLACE TRIGGER trg_images_set_updated_at
+        DROP TRIGGER IF EXISTS trg_images_set_updated_at ON ai_captioning.images;
+        CREATE TRIGGER trg_images_set_updated_at
         BEFORE UPDATE ON ai_captioning.images
         FOR EACH ROW EXECUTE FUNCTION ai_captioning.ai_captioning_set_updated_at()
         """,
@@ -287,7 +288,8 @@ _DDL = [
     (
         "Trigger: trg_descriptions_set_updated_at",
         """
-        CREATE OR REPLACE TRIGGER trg_descriptions_set_updated_at
+        DROP TRIGGER IF EXISTS trg_descriptions_set_updated_at ON ai_captioning.image_descriptions;
+        CREATE TRIGGER trg_descriptions_set_updated_at
         BEFORE UPDATE ON ai_captioning.image_descriptions
         FOR EACH ROW EXECUTE FUNCTION ai_captioning.ai_captioning_set_updated_at()
         """,
@@ -510,19 +512,20 @@ def main():
 
     print("Connected. Running DDL …\n")
     errors = 0
-    with conn:
-        with conn.cursor() as cur:
-            for label, sql in _DDL:
-                try:
-                    cur.execute(sql)
-                    print(f"  OK  {label}")
-                except psycopg2.Error as e:
-                    print(f"  FAIL {label}")
-                    print(f"       {e.pgcode}: {e.pgerror.strip() if e.pgerror else e}")
-                    conn.rollback()
-                    errors += 1
-                    # Re-open transaction so remaining steps can still run
-                    cur.execute("BEGIN")
+    with conn.cursor() as cur:
+        for label, sql in _DDL:
+            try:
+                cur.execute(sql)
+                # Commit per step: a later failure must not roll back
+                # earlier successful DDL (the old single-transaction loop
+                # discarded everything before the first error).
+                conn.commit()
+                print(f"  OK  {label}")
+            except psycopg2.Error as e:
+                print(f"  FAIL {label}")
+                print(f"       {e.pgcode}: {e.pgerror.strip() if e.pgerror else e}")
+                conn.rollback()
+                errors += 1
 
     conn.close()
 

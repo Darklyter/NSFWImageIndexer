@@ -147,9 +147,13 @@ def parse_zip_metadata(zip_path):
     # Strip bracketed extras like [17] [480x320] that appear after the main title
     clean = re.sub(r'\s*\[[^\]]*\]\s*', ' ', stem).strip()
 
-    # Extract performers from a (Name1, Name2) block
+    # Extract performers from the LAST (Name1, Name2) block — set titles can
+    # contain their own parenthesised text, e.g.
+    # 'Studio - Set (Behind The Scenes) (Alice, Bob).zip'.
     performers = []
-    perf_match = re.search(r'\(([^)]+)\)', clean)
+    perf_match = None
+    for m in re.finditer(r'\(([^)]+)\)', clean):
+        perf_match = m
     if perf_match:
         perf_str = perf_match.group(1)
         performers = [p.strip() for p in perf_str.split(',') if p.strip()]
@@ -394,6 +398,7 @@ def get_connection(host, port, user, password, dbname, apply_schema_migrations=T
         user=user,
         password=password,
         dbname=dbname,
+        connect_timeout=5,
         options=f'-c search_path={_SCHEMA},public',
     )
     if apply_schema_migrations:
@@ -813,10 +818,13 @@ def load_tags_from_file(conn, json_path, progress_callback=None):
     for entry in entries:
         tag   = (entry.get('Tag')   or entry.get('tag')   or '').strip()
         alias = (entry.get('Alias') or entry.get('alias') or '').strip()
-        if not tag or not alias:
+        if not tag:
             continue
+        # Tag-only rows (empty alias) still create the tag — export_tags
+        # emits these for canonical tags that have no aliases yet.
         tag_names.setdefault(tag.lower(), tag)
-        alias_pairs.append((tag.lower(), alias))
+        if alias:
+            alias_pairs.append((tag.lower(), alias))
 
     stats = {'tags_added': 0, 'aliases_added': 0,
              'tags_skipped': 0, 'aliases_skipped': 0}
@@ -1342,12 +1350,15 @@ def export_tags(conn):
     Sorted by tag name then alias so the export is deterministic.
     """
     with conn.cursor() as cur:
+        # LEFT JOIN: tags with no aliases must round-trip too (an INNER
+        # JOIN silently dropped them from Export Tags). They export with
+        # an empty Alias, which the loader treats as tag-only.
         cur.execute(
             """
-            SELECT t.tag, a.alias
-            FROM   tag_aliases a
-            JOIN   tags        t ON t.id = a.tag_id
-            ORDER  BY t.tag, a.alias
+            SELECT t.tag, COALESCE(a.alias, '') AS alias
+            FROM   tags t
+            LEFT   JOIN tag_aliases a ON a.tag_id = t.id
+            ORDER  BY t.tag, alias
             """
         )
         return [{"Tag": row[0], "Alias": row[1]} for row in cur.fetchall()]
@@ -1496,7 +1507,10 @@ def get_stats(conn):
         cur.execute("""
             SELECT COALESCE(AVG(kc), 0)
             FROM (
-                SELECT COUNT(*) AS kc
+                -- COUNT(ik.tag_id), not COUNT(*): a LEFT JOIN with no
+                -- keywords still yields one row, so COUNT(*) credited
+                -- zero-keyword images with 1.
+                SELECT COUNT(ik.tag_id) AS kc
                 FROM images i
                 LEFT JOIN image_keywords ik ON ik.image_id = i.id
                 GROUP BY i.id
@@ -1633,8 +1647,11 @@ def rename_tag(conn, old_name, new_name):
         if not row:
             raise ValueError(f"Tag '{old_name}' not found.")
 
+        # tags.tag is citext, so a case-only rename ('bdsm' -> 'BDSM')
+        # matches the tag being renamed — only a DIFFERENT tag is a conflict.
         cur.execute("SELECT id FROM tags WHERE tag = %s", (new_name,))
-        if cur.fetchone():
+        existing = cur.fetchone()
+        if existing and existing[0] != row[0]:
             raise ValueError(f"A tag named '{new_name}' already exists.")
 
         cur.execute("UPDATE tags SET tag = %s WHERE tag = %s", (new_name, old_name))
@@ -1927,19 +1944,23 @@ def get_processed_paths(conn, directory_prefix=None):
     with conn.cursor() as cur:
         if directory_prefix:
             prefix = os.path.normpath(directory_prefix)
-            # Match both forward and backslash variants
+            # Literal prefix compare instead of LIKE: directory names with
+            # LIKE metacharacters ('my_folder') no longer over-match, and
+            # lower() makes the filter case-insensitive to match Windows
+            # path semantics. Both slash variants are checked because
+            # stored paths may use either separator.
+            fwd = prefix.replace('\\', '/')
+            bwd = prefix.replace('/', '\\')
             cur.execute(
                 f"""
                 SELECT i.path
                 FROM   {_SCHEMA}.images i
                 JOIN   {_SCHEMA}.image_run_status irs ON irs.image_id = i.id
                 WHERE  irs.status = 'success'
-                  AND  (i.path LIKE %s OR i.path LIKE %s)
+                  AND  (left(lower(i.path), %s) = lower(%s)
+                        OR left(lower(i.path), %s) = lower(%s))
                 """,
-                (
-                    prefix.replace('\\', '/') + '%',
-                    prefix.replace('/', '\\') + '%',
-                ),
+                (len(fwd), fwd, len(bwd), bwd),
             )
         else:
             cur.execute(
@@ -1950,4 +1971,6 @@ def get_processed_paths(conn, directory_prefix=None):
                 WHERE  irs.status = 'success'
                 """
             )
-        return {os.path.normpath(row[0]) for row in cur.fetchall()}
+        # normcase: comparison keys are case-folded on Windows to match
+        # the skip-set semantics in llmii.py (_norm_path_key).
+        return {os.path.normcase(os.path.normpath(row[0])) for row in cur.fetchall()}

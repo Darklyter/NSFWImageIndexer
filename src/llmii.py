@@ -592,6 +592,17 @@ def _sha256_file(path):
         return None
 
 
+def _norm_path_key(p):
+    """Canonical form for skip-set / resume comparisons.
+
+    normcase folds case on Windows (paths are case-insensitive there, and a
+    user typing D:\\Pics vs d:\\pics across runs must not defeat resume).
+    Display/processing paths keep their original casing — only comparison
+    keys go through this.
+    """
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
 def _checkpoint_path():
     """Return the path to the session checkpoint file (project root)."""
     return Path(__file__).resolve().parent.parent / 'llmii_checkpoint.json'
@@ -1135,7 +1146,7 @@ class BackgroundIndexer(threading.Thread):
                     continue
 
                 # Skip files already processed (resume-session fast-path)
-                if self.skip_paths and file_path in self.skip_paths:
+                if self.skip_paths and _norm_path_key(file_path) in self.skip_paths:
                     continue
                         
                 try:
@@ -1974,7 +1985,7 @@ class FileProcessor:
                     if getattr(self.config, 'output_mode', 'json') not in ('db', 'both'):
                         src = new_metadata.get('SourceFile')
                         if src:
-                            self._checkpoint_paths.add(os.path.normpath(src))
+                            self._checkpoint_paths.add(_norm_path_key(src))
                             self._checkpoint_counter += 1
                             if self._checkpoint_counter >= 500:
                                 self._write_checkpoint()
@@ -3278,9 +3289,9 @@ def main(config=None, callback=None, check_paused_or_stopped=None):
             if cp.exists():
                 try:
                     data = json.loads(cp.read_text(encoding='utf-8'))
-                    if os.path.normpath(data.get('directory', '')) == os.path.normpath(str(config.directory)):
+                    if _norm_path_key(data.get('directory', '')) == _norm_path_key(str(config.directory)):
                         paths = data.get('processed_paths', [])
-                        skip_paths = {os.path.normpath(p) for p in paths}
+                        skip_paths = {_norm_path_key(p) for p in paths}
                         msg = f"Resume: {len(skip_paths):,} previously-processed files will be skipped."
                         print(msg)
                         if callback:
