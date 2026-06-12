@@ -470,7 +470,7 @@ class ExplorePerformersWindow(QMainWindow):
     def __init__(self, conn):
         super().__init__()
         self.conn            = conn
-        self._all_performers = []   # [(id, name, image_count), ...]
+        self._all_performers = []   # [(id, name, total_images, processed_images), ...]
         self._images         = []   # [(image_id, path), ...]
         self._img_index      = 0
         self._current_pid    = None
@@ -896,6 +896,12 @@ class ExplorePerformersWindow(QMainWindow):
             self._load_performer_tags(self._current_pid)
             self._load_image_tag_stats(self._current_pid)
         except Exception as e:
+            # Clear aborted-transaction state, or every later query on this
+            # shared connection fails until the next performer re-select.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             QMessageBox.critical(self, "Error", str(e))
 
     def _exclude_performer_tag(self, tag_id):
@@ -918,6 +924,12 @@ class ExplorePerformersWindow(QMainWindow):
             self._load_performer_tags(self._current_pid)
             self._load_image_tag_stats(self._current_pid)
         except Exception as e:
+            # Clear aborted-transaction state, or every later query on this
+            # shared connection fails until the next performer re-select.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             QMessageBox.critical(self, "Error", str(e))
 
     def _exclude_tag_globally(self, tag_id, tag_name):
@@ -948,6 +960,12 @@ class ExplorePerformersWindow(QMainWindow):
                 self._load_performer_tags(self._current_pid)
                 self._load_image_tag_stats(self._current_pid)
         except Exception as e:
+            # Clear aborted-transaction state, or every later query on this
+            # shared connection fails until the next performer re-select.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             QMessageBox.critical(self, "Error", str(e))
 
     def _add_tag_to_performer(self):
@@ -973,6 +991,10 @@ class ExplorePerformersWindow(QMainWindow):
                 self._load_performer_tags(self._current_pid)
                 self._load_image_tag_stats(self._current_pid)
             except Exception as e:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 QMessageBox.critical(self, "Error", str(e))
 
     # ------------------------------------------------------------------
@@ -990,6 +1012,12 @@ class ExplorePerformersWindow(QMainWindow):
                     JOIN   image_keywords   ik ON ik.image_id = ip.image_id
                     JOIN   tags             t  ON t.id = ik.tag_id
                     WHERE  ip.performer_id = %s
+                      -- globally blacklisted tags must not appear here:
+                      -- they're filtered from the chips and Add Tag picker,
+                      -- so attaching one from this pane made it invisible
+                      -- everywhere (and 'Blacklist for ALL' left the tag
+                      -- sitting in this list)
+                      AND  NOT COALESCE(t.exclude_from_performers, FALSE)
                       AND  t.id NOT IN (
                                SELECT tag_id
                                FROM   performer_tags
@@ -1073,6 +1101,12 @@ class ExplorePerformersWindow(QMainWindow):
             self._load_performer_tags(self._current_pid)
             self._load_image_tag_stats(self._current_pid)
         except Exception as e:
+            # Clear aborted-transaction state, or every later query on this
+            # shared connection fails until the next performer re-select.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             QMessageBox.critical(self, "Error", str(e))
 
     # ------------------------------------------------------------------
@@ -1127,6 +1161,26 @@ class ExplorePerformersWindow(QMainWindow):
                 """, (tgt_id, src_id))
 
                 cur.execute("DELETE FROM performer_tags WHERE performer_id = %s", (src_id,))
+
+                # Refresh statistics on the target's rows — merged rows carry
+                # the source's image_count/total_images, which are stale once
+                # the images have moved.
+                cur.execute("""
+                    UPDATE performer_tags pt
+                    SET image_count = COALESCE((
+                            SELECT COUNT(DISTINCT ik.image_id)
+                            FROM   image_performers ip
+                            JOIN   image_keywords ik ON ik.image_id = ip.image_id
+                            WHERE  ip.performer_id = pt.performer_id
+                              AND  ik.tag_id = pt.tag_id
+                        ), 0),
+                        total_images = (
+                            SELECT COUNT(*) FROM image_performers
+                            WHERE performer_id = pt.performer_id
+                        )
+                    WHERE pt.performer_id = %s
+                """, (tgt_id,))
+
                 cur.execute("DELETE FROM performers WHERE id = %s", (src_id,))
             self.conn.commit()
 
@@ -1205,7 +1259,14 @@ class ExplorePerformersWindow(QMainWindow):
                 )
                 row = cur.fetchone()
                 self.caption_lbl.setText(row[0] if row else "(no caption)")
-        except Exception:
+        except Exception as e:
+            # Without the rollback, one failed query silently poisoned the
+            # shared connection and every later image showed no caption/tags.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            print(f"Caption query error: {e}")
             self.caption_lbl.setText("")
 
         # Image tags
@@ -1219,7 +1280,12 @@ class ExplorePerformersWindow(QMainWindow):
                     ORDER  BY t.tag
                 """, (image_id,))
                 img_tags = [row[0] for row in cur.fetchall()]
-        except Exception:
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            print(f"Image tags query error: {e}")
             img_tags = []
 
         self.img_tags_scroll.setWidget(
@@ -1275,6 +1341,10 @@ def main():
         try:
             _llmii_db.apply_migrations(conn)
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             print(f"Warning: could not apply migrations: {e}")
 
     app = QApplication(sys.argv)
