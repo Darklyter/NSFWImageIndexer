@@ -954,7 +954,7 @@ def load_tags_from_file(conn, json_path, progress_callback=None):
     return stats
 
 
-def assign_performer_tags(conn):
+def assign_performer_tags(conn, performer_id=None):
     """Assign canonical tags to performers based on statistical prevalence.
 
     For each performer that has at least one processed image, finds all tags
@@ -966,6 +966,10 @@ def assign_performer_tags(conn):
     Tags with ``exclude_from_performers = TRUE`` on the tags table are skipped
     globally regardless of prevalence.
 
+    When *performer_id* is given, only that performer is evaluated (used by
+    explore_performers.py to refresh the performer being viewed without
+    sweeping the whole database).
+
     Returns a dict with keys:
         performers_checked  — number of performers evaluated
         tags_assigned       — rows inserted or updated in performer_tags
@@ -976,13 +980,15 @@ def assign_performer_tags(conn):
 
     with conn.cursor() as cur:
         # All performers with at least one image in image_performers
+        # (or just the requested one)
         cur.execute("""
             SELECT p.id, COUNT(ip.image_id) AS total
             FROM   performers p
             JOIN   image_performers ip ON ip.performer_id = p.id
+            WHERE  (%s::int IS NULL OR p.id = %s)
             GROUP  BY p.id
             HAVING COUNT(ip.image_id) > 0
-        """)
+        """, (performer_id, performer_id))
         performers = cur.fetchall()
 
         for performer_id, total_images in performers:

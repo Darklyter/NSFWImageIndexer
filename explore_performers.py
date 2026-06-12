@@ -602,6 +602,16 @@ class ExplorePerformersWindow(QMainWindow):
         btn_row.setSpacing(4)
         btn_row.setContentsMargins(0, 2, 0, 0)
 
+        self.assign_tags_btn = QPushButton("Assign Tags")
+        self.assign_tags_btn.setToolTip(
+            "Auto-assign tags that appear on ≥40% of THIS performer's images "
+            "(same logic as the main app's Assign Performer Tags, scoped to "
+            "the current performer)"
+        )
+        self.assign_tags_btn.setEnabled(False)
+        self.assign_tags_btn.clicked.connect(self._assign_tags_current)
+        btn_row.addWidget(self.assign_tags_btn)
+
         self.add_tag_btn = QPushButton("Add Tag…")
         self.add_tag_btn.setToolTip("Manually assign a tag to this performer")
         self.add_tag_btn.setEnabled(False)
@@ -781,6 +791,7 @@ class ExplorePerformersWindow(QMainWindow):
         self._load_performer_images(pid)
         self._load_performer_tags(pid)
         self._load_image_tag_stats(pid)
+        self.assign_tags_btn.setEnabled(_HAS_LLMII_DB)
         self.add_tag_btn.setEnabled(True)
         self.tag_review_btn.setEnabled(True)
         self.merge_btn.setEnabled(True)
@@ -856,7 +867,7 @@ class ExplorePerformersWindow(QMainWindow):
             self.perf_tags_info_lbl.setText("")
             widget = _placeholder(
                 "No performer tags assigned.\n\n"
-                "Run 'Assign Performer Tags' in the main settings dialog,\n"
+                "Click 'Assign Tags' to auto-assign tags for this performer,\n"
                 "or use 'Add Tag…' to assign one manually."
             )
         self.perf_tags_scroll.setWidget(widget)
@@ -967,6 +978,31 @@ class ExplorePerformersWindow(QMainWindow):
             except Exception:
                 pass
             QMessageBox.critical(self, "Error", str(e))
+
+    def _assign_tags_current(self):
+        """Run the statistical performer-tag assignment for ONLY the
+        currently-viewed performer (mirrors the main app's batch function,
+        scoped to one performer)."""
+        if self._current_pid is None or not _HAS_LLMII_DB:
+            return
+        try:
+            result = _llmii_db.assign_performer_tags(
+                self.conn, performer_id=self._current_pid)
+            self._load_performer_tags(self._current_pid)
+            self._load_image_tag_stats(self._current_pid)
+            QMessageBox.information(
+                self, "Assign Tags",
+                f"{self._current_pname or 'Performer'}: "
+                f"{result['tags_assigned']} tag(s) assigned, "
+                f"{result['tags_removed']} stale tag(s) removed.\n\n"
+                "Tags appearing on at least 40% of this performer's images "
+                "are assigned; pinned, manual, and excluded tags are kept.")
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Assign Tags Failed", str(e))
 
     def _add_tag_to_performer(self):
         if self._current_pid is None:
