@@ -16,4 +16,4 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = []
+dev = ["pytest"]
