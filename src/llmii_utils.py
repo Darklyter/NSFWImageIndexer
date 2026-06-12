@@ -1107,8 +1107,15 @@ def de_pluralize(word, custom=None):
         if len(words) > 1 and words[1] in plural_prepositions:
             return de_pluralize(words[0], custom) + "-" + "-".join(words[1:])
 
-    # Check for words ending in '-ie'
-    if any(lower_cased_word.endswith(w + "s") for w in singular_ie):
+    # Check for words ending in '-ie'. Short entries (pie, tie) match the
+    # WHOLE word only — suffix-matching them would catch every regular
+    # -pies/-ties plural (parties, cities, puppies) before the 'ies$ -> y'
+    # rule and corrupt them to 'partie'/'citie'/'puppie'.
+    if any(
+        (lower_cased_word == w + "s") if len(w) <= 3
+        else lower_cased_word.endswith(w + "s")
+        for w in singular_ie
+    ):
         return word[:-1]
 
     # Check for irregular words

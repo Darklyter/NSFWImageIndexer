@@ -15,6 +15,8 @@ class FakeCursor:
         self.statements.append((s, params))
         if s.startswith("SELECT 1 FROM images WHERE identifier"):
             self._next = (1,) if self.identifier_taken else None
+        elif s.startswith("SELECT id FROM images WHERE lower(path)"):
+            self._next = None  # no existing row — exercise the INSERT path
         elif "RETURNING id" in s or s.startswith("SELECT id"):
             self._next = (1,)
         else:
@@ -106,3 +108,25 @@ def test_unique_identifier_is_kept():
     llmii_db.write_image_to_db(conn, r"C:\pics\a.jpg", dict(META), run_id=7)
     ins = find(conn.cur.statements, r"INSERT INTO images")[0]
     assert ins[1][0] == META["XMP:Identifier"]
+
+
+def test_status_only_write_never_touches_keywords():
+    """Verification-sweep blocker: a failed reprocess with empty keywords
+    must not run the image-wide replacement deletes."""
+    conn = FakeConn()
+    failed = {
+        "XMP:Identifier": META["XMP:Identifier"],
+        "XMP:Status": "failed",
+        "MWG:Keywords": [],
+        "_raw_keywords": [],
+        "_debug_map": {},
+        "_status_only": True,
+    }
+    llmii_db.write_image_to_db(conn, r"C:\pics\a.jpg", failed, run_id=8)
+    assert conn.committed
+    # Run status recorded...
+    assert find(conn.cur.statements, r"INSERT INTO image_run_status")
+    # ...but no keyword/description statements of any kind
+    assert not find(conn.cur.statements, r"DELETE FROM image_keywords")
+    assert not find(conn.cur.statements, r"INSERT INTO image_keywords")
+    assert not find(conn.cur.statements, r"image_descriptions")

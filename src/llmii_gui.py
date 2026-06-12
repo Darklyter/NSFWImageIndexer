@@ -1734,7 +1734,10 @@ class IndexerThread(QThread):
             while self.paused and not self.stopped:
                 self.msleep(100)
             if self.stopped:
-                raise Exception("Indexer stopped by user")
+                # Same dedicated type as the direct-stop path above — a
+                # plain Exception here was swallowed as a per-file error
+                # and recorded the run as 'failed' instead of 'cancelled'.
+                raise llmii.StopProcessing("Indexer stopped by user")
         return self.paused
 
 class _DbOpWorker(QThread):
@@ -2266,8 +2269,13 @@ class ImageIndexerGUI(QMainWindow):
         if self.api_check_thread and self.api_check_thread.isRunning():
             self.api_check_thread.stop()
             # Bounded: an in-flight probe holds the thread for up to its
-            # request timeout; don't freeze the GUI waiting for it.
-            self.api_check_thread.wait(3000)
+            # request timeout; don't freeze the GUI waiting for it. If the
+            # wait times out, park the old thread so reassigning the
+            # attribute can't drop the last reference to a live QThread.
+            if not self.api_check_thread.wait(3000):
+                if not hasattr(self, '_stale_api_threads'):
+                    self._stale_api_threads = []
+                self._stale_api_threads.append(self.api_check_thread)
             
         self.api_is_ready = False
         self.run_button.setEnabled(False)
@@ -2449,8 +2457,10 @@ class ImageIndexerGUI(QMainWindow):
                 try:
                     import json as _json
                     data = _json.loads(cp.read_text(encoding='utf-8'))
-                    import os as _os
-                    if _os.path.normpath(data.get('directory', '')) == _os.path.normpath(directory):
+                    # Same normalization as the engine (_norm_path_key):
+                    # case-folded on Windows, so the dialog's verdict always
+                    # matches what the run will actually do.
+                    if llmii._norm_path_key(data.get('directory', '')) == llmii._norm_path_key(directory):
                         n = len(data.get('processed_paths', []))
                         msg = (
                             f"Found checkpoint: {n:,} previously-processed files will be skipped.\n\n"

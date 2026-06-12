@@ -1991,6 +1991,11 @@ class FileProcessor:
                                 self.config.reprocess_failed or self.config.reprocess_all
                             ):
                                 already_done.add(composite_key)
+                            elif db_st == 'invalid' and not self.config.reprocess_all:
+                                # Validation verdicts are permanent unless a
+                                # full reprocess is requested — no point
+                                # re-extracting these members every run.
+                                already_done.add(composite_key)
                     except Exception as e:
                         print(f"DB zip status check error for {zip_source_name}: {e}")
                 else:
@@ -2007,10 +2012,18 @@ class FileProcessor:
                             continue
                         st = sc.get('Status')
                         if st == 'success' and not self.config.reprocess_all:
+                            # Mirror the DB branch: sparse reprocess pulls
+                            # under-tagged members back in (the sidecar
+                            # carries the keyword list, so count from it).
+                            if (self.config.reprocess_sparse
+                                    and len(sc.get('Keywords') or []) < self.config.reprocess_sparse_min):
+                                continue
                             already_done.add(composite_key)
                         elif st == 'failed' and not (
                             self.config.reprocess_failed or self.config.reprocess_all
                         ):
+                            already_done.add(composite_key)
+                        elif st == 'invalid' and not self.config.reprocess_all:
                             already_done.add(composite_key)
 
                 to_extract = [i for i in internal_images if composites[i.filename] not in already_done]
@@ -2147,8 +2160,11 @@ class FileProcessor:
                     # Checkpoint (non-DB mode): track processed path and flush
                     # periodically. Only files whose metadata write SUCCEEDED
                     # are recorded — checkpointing failures made resume skip
-                    # files that have no persisted output.
+                    # files that have no persisted output. Dry runs write
+                    # nothing, so they must not checkpoint either (a later
+                    # real Resume would skip never-tagged files).
                     if (file_ok
+                            and not self.config.dry_run
                             and getattr(self.config, 'output_mode', 'json') not in ('db', 'both')):
                         src = new_metadata.get('SourceFile')
                         if src:
@@ -2191,6 +2207,7 @@ class FileProcessor:
                         orphan_meta["MWG:Keywords"] = []
                         orphan_meta["_raw_keywords"] = []
                         orphan_meta["_debug_map"] = {}
+                        orphan_meta["_status_only"] = True
                         written = self.write_metadata(file_path, orphan_meta)
 
                         if written:
@@ -2518,6 +2535,7 @@ class FileProcessor:
                                 "XMP:Status": "invalid",
                                 "XMP:Identifier": metadata.get("XMP:Identifier")
                                                   or str(uuid.uuid4()),
+                                "_status_only": True,
                             }
                             for _k in ('_zip_db_key', '_zip_source'):
                                 if _k in metadata:
@@ -2614,6 +2632,11 @@ class FileProcessor:
                     failed_meta["MWG:Keywords"] = []
                     failed_meta["_raw_keywords"] = []
                     failed_meta["_debug_map"] = {}
+                    # Status-only: the DB layer must not run its keyword-
+                    # replacement deletes for this write, or a transient
+                    # failure during reprocess would wipe the image's
+                    # previously stored keywords.
+                    failed_meta["_status_only"] = True
                     self.write_metadata(file_path, failed_meta)
                 
                 
@@ -2822,7 +2845,11 @@ class FileProcessor:
 
             else:
                 status = "success"
-                raw_keywords = list(keywords)
+                # Coerce here too: the combined caption_and_keywords path
+                # reaches this point via clean_json (not clean_tags), so a
+                # string Keywords value would char-explode into
+                # image_keywords_raw and the debug display.
+                raw_keywords = _coerce_keyword_list(keywords)
                 keywords, debug_map = self.process_keywords(
                     metadata, keywords, return_debug=True,
                     caption=generated_caption,
@@ -2897,7 +2924,22 @@ class FileProcessor:
             try:
                 zip_sidecar = (self._zip_sidecar_path(metadata['_zip_db_key'])
                                if metadata.get('_zip_db_key') else None)
-                if not self._write_json_sidecar(file_path, metadata,
+                meta_for_sidecar = metadata
+                if metadata.get('_status_only'):
+                    # Status-only write: update Status in the sidecar but
+                    # preserve the existing caption/keywords/identifier from
+                    # the last successful generation.
+                    existing = self._read_json_sidecar(file_path,
+                                                       sidecar_path=zip_sidecar) or {}
+                    merged = dict(metadata)
+                    if existing.get('Description'):
+                        merged['MWG:Description'] = existing['Description']
+                    if existing.get('Keywords'):
+                        merged['MWG:Keywords'] = existing['Keywords']
+                    if existing.get('Identifier') and not merged.get('XMP:Identifier'):
+                        merged['XMP:Identifier'] = existing['Identifier']
+                    meta_for_sidecar = merged
+                if not self._write_json_sidecar(file_path, meta_for_sidecar,
                                                 sidecar_path=zip_sidecar):
                     success = False
             except Exception as e:
@@ -3493,21 +3535,36 @@ class FileProcessor:
                 return _BLACKLISTED
             return result
 
-        def _expand_and_or(keywords):
-            """Split 'X and Y' / 'X or Y' keywords into separate keywords
-            (the documented split_and_entries behavior), keeping idioms in
-            AND_EXCEPTIONS whole."""
-            if not getattr(self.config, 'split_and_entries', False):
-                return list(keywords)
-            out = []
-            for kw in keywords:
-                parts = kw.strip().split()
-                if (len(parts) == 3 and parts[1].lower() in ('and', 'or')
-                        and ' '.join(p.lower() for p in parts) not in AND_EXCEPTIONS):
-                    out.extend([parts[0], parts[2]])
-                else:
-                    out.append(kw)
-            return out
+        _matcher_on = self.tag_matcher.enabled or self.tag_matcher_fallback.enabled
+
+        def _and_or_halves(kw):
+            parts = kw.strip().split()
+            if (getattr(self.config, 'split_and_entries', False)
+                    and len(parts) == 3 and parts[1].lower() in ('and', 'or')
+                    and ' '.join(p.lower() for p in parts) not in AND_EXCEPTIONS):
+                return [parts[0], parts[2]]
+            return None
+
+        def _resolve_with_split(kw):
+            """Resolve kw, splitting 'X and Y' into halves — but exact
+            vocabulary phrases ('Bra and Panties', 'S and M', 'Wet and
+            Messy') win over splitting: the halves are only tried when the
+            whole phrase doesn't resolve. Returns (debug_value, [tags])."""
+            halves = _and_or_halves(kw)
+            if halves is None:
+                r = _resolve(kw)
+                return r, ([r] if r and r is not _BLACKLISTED else [])
+            if _matcher_on:
+                whole = _resolve(kw)
+                if whole:
+                    return whole, ([whole] if whole is not _BLACKLISTED else [])
+            results = [_resolve(h) for h in halves]
+            good = [r for r in results if r and r is not _BLACKLISTED]
+            if good:
+                return ' + '.join(good), good
+            if _BLACKLISTED in results:
+                return _BLACKLISTED, []
+            return None, []
 
         if self.config.update_keywords:
             existing_keywords = metadata.get("MWG:Keywords", [])
@@ -3515,17 +3572,15 @@ class FileProcessor:
             if isinstance(existing_keywords, str):
                 existing_keywords = [k.strip() for k in existing_keywords.split(",")]
 
-            for keyword in _expand_and_or(_coerce_keyword_list(existing_keywords)):
-                resolved = _resolve(keyword)
-                if resolved and resolved is not _BLACKLISTED:
-                    all_keywords.add(resolved)
+            for keyword in _coerce_keyword_list(existing_keywords):
+                _, tags = _resolve_with_split(keyword)
+                all_keywords.update(tags)
 
         debug_map = {}
-        for keyword in _expand_and_or(_coerce_keyword_list(new_keywords)):
-            resolved = _resolve(keyword)
-            debug_map[keyword] = resolved
-            if resolved and resolved is not _BLACKLISTED:
-                all_keywords.add(resolved)
+        for keyword in _coerce_keyword_list(new_keywords):
+            dbg, tags = _resolve_with_split(keyword)
+            debug_map[keyword] = dbg
+            all_keywords.update(tags)
 
         # Caption-based pattern extraction: scan the LLM's description text with
         # the normalizer patterns to catch tags that were implicit in the caption

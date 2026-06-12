@@ -6,10 +6,21 @@ from src.llmii_utils import JsonFixError, de_pluralize, first_json, repair_json
 
 class TestDePluralize:
     def test_pies_and_ties(self):
-        # '^pie'/'^tie' anchors made the endswith() guard dead code
+        # exact-word match: 'pies'/'ties' protected, but regular -ies
+        # plurals still follow the 'ies$ -> y' rule
         assert de_pluralize("pies") == "pie"
         assert de_pluralize("ties") == "tie"
-        assert de_pluralize("panties") == "pantie"
+        assert de_pluralize("panties") == "panty"
+
+    def test_regular_ies_plurals_not_corrupted(self):
+        # suffix-matching 'pie'/'tie' corrupted these to partie/citie/puppie
+        assert de_pluralize("parties") == "party"
+        assert de_pluralize("cities") == "city"
+        assert de_pluralize("puppies") == "puppy"
+        assert de_pluralize("activities") == "activity"
+        # long -ie entries still suffix/exact match correctly
+        assert de_pluralize("cookies") == "cookie"
+        assert de_pluralize("zombies") == "zombie"
 
     def test_lone_s_not_emptied(self):
         assert de_pluralize("s") == "s"

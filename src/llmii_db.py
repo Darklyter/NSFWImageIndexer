@@ -231,9 +231,11 @@ def _upsert_image(cur, file_path, identifier, gallery_id=None, zip_source=None,
     # images.identifier is UNIQUE — reusing it for a second path would
     # raise IntegrityError and abort this image's whole write. Track the
     # copy as its own row under a fresh UUID instead (content-level
-    # duplicate detection is what the sha256 column is for).
+    # duplicate detection is what the sha256 column is for). This check
+    # runs before BOTH branches below — the row-reuse UPDATE also writes
+    # the identifier.
     cur.execute(
-        "SELECT 1 FROM images WHERE identifier = %s AND path <> %s",
+        "SELECT 1 FROM images WHERE identifier = %s AND lower(path) <> lower(%s)",
         (identifier, path_str),
     )
     if cur.fetchone():
@@ -241,6 +243,30 @@ def _upsert_image(cur, file_path, identifier, gallery_id=None, zip_source=None,
         print(f"Identifier {identifier} already belongs to another path; "
               f"assigning {new_id} to {filename}")
         identifier = new_id
+
+    # Case-insensitive row reuse: Windows paths are case-insensitive, so a
+    # directory typed as D:\Pics one run and d:\pics the next must hit the
+    # SAME image row — an exact-case ON CONFLICT(path) would create a
+    # duplicate row instead (uses images_path_lower_idx).
+    cur.execute(
+        "SELECT id FROM images WHERE lower(path) = lower(%s)",
+        (path_str,),
+    )
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            """
+            UPDATE images SET
+                identifier = %s,
+                gallery_id = %s,
+                zip_source = %s,
+                sha256     = COALESCE(%s, sha256),
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (identifier, gallery_id, zip_source, sha256, existing[0]),
+        )
+        return existing[0]
 
     cur.execute(
         """
@@ -358,15 +384,29 @@ def apply_migrations(conn):
         "ALTER TABLE images DROP CONSTRAINT IF EXISTS images_sha256_key",
         "CREATE INDEX IF NOT EXISTS images_sha256_idx ON images (sha256) WHERE sha256 IS NOT NULL",
         # 'invalid' status: files that failed ExifTool validation are now
-        # recorded so they aren't re-validated on every run.
+        # recorded so they aren't re-validated on every run. Guarded so the
+        # constraint is only rebuilt when it actually lacks 'invalid' —
+        # re-adding a CHECK revalidates every image_run_status row, which
+        # is an expensive lock on every connect for large databases.
         """
         DO $$
         BEGIN
-            ALTER TABLE image_run_status DROP CONSTRAINT IF EXISTS image_run_status_status_check;
-            ALTER TABLE image_run_status ADD CONSTRAINT image_run_status_status_check
-                CHECK (status = ANY (ARRAY['success','failed','skipped','invalid']));
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'image_run_status_status_check'
+                  AND pg_get_constraintdef(oid) LIKE '%invalid%'
+            ) THEN
+                ALTER TABLE image_run_status DROP CONSTRAINT IF EXISTS image_run_status_status_check;
+                ALTER TABLE image_run_status ADD CONSTRAINT image_run_status_status_check
+                    CHECK (status = ANY (ARRAY['success','failed','skipped','invalid']));
+            END IF;
         END $$
         """,
+        # Case-insensitive path lookups (Windows paths): used by
+        # get_image_status_batch and _upsert_image so a directory typed in
+        # different case across runs can't cause reprocessing or duplicate
+        # image rows.
+        "CREATE INDEX IF NOT EXISTS images_path_lower_idx ON images (lower(path))",
     ]
     # Each migration runs under its own SAVEPOINT so one failing statement
     # (e.g. on a partially-built or divergent schema) neither aborts the
@@ -473,6 +513,9 @@ def get_image_status_batch(conn, file_paths):
     """
     if not file_paths:
         return {}
+    # Case-insensitive match (Windows paths), keyed back to the exact
+    # strings the caller passed so lookups on its side keep working.
+    by_lower = {str(p).lower(): p for p in file_paths}
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -487,11 +530,16 @@ def get_image_status_batch(conn, file_paths):
                     FROM image_keywords ik
                     WHERE ik.image_id = i.id) AS keyword_count
             FROM images i
-            WHERE i.path = ANY(%s)
+            WHERE lower(i.path) = ANY(%s)
             """,
-            (list(file_paths),),
+            (list(by_lower.keys()),),
         )
-        return {row[0]: (row[1], row[2], row[3]) for row in cur.fetchall()}
+        out = {}
+        for row in cur.fetchall():
+            orig = by_lower.get(row[0].lower())
+            if orig is not None:
+                out[orig] = (row[1], row[2], row[3])
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +642,13 @@ def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None,
     raw_keywords = metadata.get('_raw_keywords') or []
     debug_map    = metadata.get('_debug_map') or {}
     status       = metadata.get('XMP:Status') or 'success'
+    # Status-only writes (failed generation, orphan marker, invalid verdict)
+    # record an outcome WITHOUT a new keyword generation. They must never
+    # touch the keyword/description tables: combined with the image-wide
+    # replacement delete below, a transiently failed reprocess of a
+    # previously successful image would otherwise wipe all of its stored
+    # keywords and insert nothing.
+    status_only  = bool(metadata.get('_status_only'))
 
     # For zip images the DB key is a composite 'zip_path::internal_path'.
     # Use the internal path portion for gallery/performer parsing.
@@ -702,6 +757,13 @@ def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None,
                 """,
                 (image_id, run_id, status),
             )
+
+            # Status-only writes stop here: the image row and run status are
+            # recorded, but the existing description and keyword data — which
+            # belong to the last successful generation — stay untouched.
+            if status_only:
+                conn.commit()
+                return
 
             # Description (one row per image, updated in place)
             if description:
