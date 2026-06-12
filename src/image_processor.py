@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple, Union, List
 import rawpy
-from PIL import Image
+from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
 class ImageProcessor:
@@ -71,16 +71,20 @@ class ImageProcessor:
         return None
     
     def _calculate_dimensions(self, width, height):
-        """ Calculate dimensions maintaining aspect ratio and patch compatibility 
+        """ Calculate dimensions maintaining aspect ratio and patch compatibility.
+
+        scale is capped at 1.0 — images already smaller than max_dimension
+        are NOT upscaled (a blurry bicubic enlargement wastes vision tokens
+        and adds no detail; a 300x200 thumbnail used to be blown up to the
+        full res_limit). Patch rounding clamps to max_dimension so the
+        ceil() can no longer push results past the configured limit.
         """
-        scale = min(self.max_dimension / width, self.max_dimension / height)
-        
-        scaled_width = width * scale
-        scaled_height = height * scale
-        
-        new_width = math.ceil(scaled_width / self.lcm) * self.lcm
-        new_height = math.ceil(scaled_height / self.lcm) * self.lcm
-        
+        scale = min(self.max_dimension / width, self.max_dimension / height, 1.0)
+
+        limit = max(self.lcm, (self.max_dimension // self.lcm) * self.lcm)
+        new_width = min(limit, max(self.lcm, round(width * scale / self.lcm) * self.lcm))
+        new_height = min(limit, max(self.lcm, round(height * scale / self.lcm) * self.lcm))
+
         return new_width, new_height
 
     def _resize_image(self, img):
@@ -100,6 +104,9 @@ class ImageProcessor:
                 thumb = raw.extract_thumb()
                 if thumb.format == rawpy.ThumbFormat.JPEG:
                     thumb_img = Image.open(io.BytesIO(thumb.data))
+                    # Embedded thumbnails carry the camera's EXIF rotation
+                    # (the raw.postprocess() path below applies it itself)
+                    thumb_img = ImageOps.exif_transpose(thumb_img)
                     resized = self._resize_image(thumb_img)
                     buffer = io.BytesIO()
                     resized.save(buffer, format="JPEG", quality=95)
@@ -131,6 +138,10 @@ class ImageProcessor:
                 register_heif_opener()
                 
             with Image.open(file_path) as img:
+                # Apply the EXIF Orientation tag — PIL does not auto-rotate,
+                # so portrait phone/camera shots were sent to the VLM
+                # sideways or upside-down.
+                img = ImageOps.exif_transpose(img)
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                     
