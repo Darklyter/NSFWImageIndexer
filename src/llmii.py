@@ -1422,11 +1422,34 @@ class FileProcessor:
         else:
             return os.path.splitext(file_path)[0] + ".json"
 
-    def _read_json_sidecar(self, file_path):
+    def _zip_sidecar_path(self, composite_key):
+        """Return a PERSISTENT sidecar path for an image inside a zip archive.
+
+        Zip images are extracted to a temp dir that is deleted after the zip
+        is processed, so their sidecars must not live next to the temp file
+        (they would be destroyed with it). The path is derived solely from
+        the composite key '<zip_abs>::<member>' so it can be computed both
+        at write time and at extract time (before extraction) for the
+        already-processed check.
+        """
+        zip_abs, member = composite_key.split('::', 1)
+        safe_member = member.replace('/', '_').replace('\\', '_')
+        if self.config.sidecar_dir:
+            zip_norm = os.path.abspath(zip_abs).replace('\\', '/')
+            safe_zip = zip_norm.replace(':', '').replace('/', '_').strip('_')
+            return os.path.join(self.config.sidecar_dir,
+                                f"{safe_zip}---{safe_member}.json")
+        # Default: a sidecar folder next to the zip itself.
+        return os.path.join(os.path.dirname(zip_abs),
+                            Path(zip_abs).stem + ".sidecars",
+                            safe_member + ".json")
+
+    def _read_json_sidecar(self, file_path, sidecar_path=None):
         """Read a JSON sidecar file for the given image path.
         Returns a dict or None if the sidecar does not exist or cannot be read.
         """
-        sidecar_path = self._get_sidecar_path(file_path)
+        if sidecar_path is None:
+            sidecar_path = self._get_sidecar_path(file_path)
         if not os.path.exists(sidecar_path):
             return None
         try:
@@ -1436,13 +1459,15 @@ class FileProcessor:
             print(f"Error reading JSON sidecar for {os.path.basename(file_path)}: {e}")
             return None
 
-    def _write_json_sidecar(self, file_path, metadata):
+    def _write_json_sidecar(self, file_path, metadata, sidecar_path=None):
         """Write description, keywords, status and identifier to a JSON sidecar file.
         Returns True on success, False on failure.
         """
-        sidecar_path = self._get_sidecar_path(file_path)
-        if self.config.sidecar_dir:
-            os.makedirs(self.config.sidecar_dir, exist_ok=True)
+        if sidecar_path is None:
+            sidecar_path = self._get_sidecar_path(file_path)
+        sidecar_parent = os.path.dirname(sidecar_path)
+        if sidecar_parent:
+            os.makedirs(sidecar_parent, exist_ok=True)
         try:
             data = {
                 "Description": metadata.get("MWG:Description") or "",
@@ -1745,6 +1770,25 @@ class FileProcessor:
                                 already_done.add(composite_key)
                     except Exception as e:
                         print(f"DB zip status check error for {zip_source_name}: {e}")
+                else:
+                    # JSON mode (no DB): check the persistent composite-keyed
+                    # sidecars so already-processed zips are not re-extracted
+                    # and re-tagged on every run.
+                    for composite_key in composites.values():
+                        try:
+                            sc = self._read_json_sidecar(
+                                '', sidecar_path=self._zip_sidecar_path(composite_key))
+                        except Exception:
+                            continue
+                        if not sc:
+                            continue
+                        st = sc.get('Status')
+                        if st == 'success' and not self.config.reprocess_all:
+                            already_done.add(composite_key)
+                        elif st == 'failed' and not (
+                            self.config.reprocess_failed or self.config.reprocess_all
+                        ):
+                            already_done.add(composite_key)
 
                 to_extract = [i for i in internal_images if composites[i.filename] not in already_done]
                 if not to_extract:
@@ -2500,8 +2544,10 @@ class FileProcessor:
 
         For images extracted from zip archives, the metadata dict contains
         ``_zip_db_key`` (the composite DB path) and ``_zip_source`` (zip filename).
-        The JSON sidecar is written to the temp file location; the DB row uses
-        the composite key so subsequent runs can identify already-processed images.
+        The JSON sidecar is written to a persistent location derived from the
+        composite key (the temp extraction dir is deleted after processing);
+        the DB row uses the composite key so subsequent runs can identify
+        already-processed images.
         """
         if self.config.dry_run:
             print("Dry run. Not writing.")
@@ -2514,10 +2560,15 @@ class FileProcessor:
         db_path   = metadata.get('_zip_db_key') or file_path
         zip_source = metadata.get('_zip_source') or None
 
-        # JSON sidecar write (uses the actual temp file path, not the composite key)
+        # JSON sidecar write. Zip images get a persistent composite-keyed
+        # sidecar — writing next to the temp file would be destroyed by
+        # _cleanup_zip_temp.
         if output_mode in ('json', 'both'):
             try:
-                if not self._write_json_sidecar(file_path, metadata):
+                zip_sidecar = (self._zip_sidecar_path(metadata['_zip_db_key'])
+                               if metadata.get('_zip_db_key') else None)
+                if not self._write_json_sidecar(file_path, metadata,
+                                                sidecar_path=zip_sidecar):
                     success = False
             except Exception as e:
                 print(f"Metadata Write Error: {os.path.basename(file_path)}")
