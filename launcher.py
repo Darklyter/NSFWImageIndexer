@@ -207,10 +207,14 @@ def launch_model():
             _kobold_process = exe_path.name
         else:
             # Linux - use $TERMINAL or fallback
+            import shlex
             terminal = os.environ.get('TERMINAL', 'x-terminal-emulator')
-            cmd_str = ' '.join([f'"{arg}"' for arg in cmd])
+            # shlex.quote: naive double-quoting broke (or executed!) paths
+            # and URLs containing $, backticks, or quotes inside bash -c
+            cmd_str = ' '.join(shlex.quote(str(arg)) for arg in cmd)
+            inner = f"cd {shlex.quote(str(working_dir))} && {cmd_str}; exec bash"
             try:
-                subprocess.Popen([terminal, "-e", f"bash -c 'cd \"{working_dir}\" && {cmd_str}; exec bash'"])
+                subprocess.Popen([terminal, "-e", f"bash -c {shlex.quote(inner)}"])
                 # Save exe name for cleanup
                 _kobold_process = exe_path.name
             except FileNotFoundError:

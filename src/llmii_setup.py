@@ -51,8 +51,13 @@ class GpuDetector:
 
             for line in output.splitlines():
                 if line.strip().startswith('CUDA'):
-                    self.summary["cuda_version"] = line.split()[3]
-                    self.summary["cuda_available"] = True
+                    # Extract a numeric version; fixed-index split()[3]
+                    # captured garbage tokens like 'N/A' on some drivers,
+                    # which later crashed float() in the build chooser.
+                    m = re.search(r'(\d+\.\d+)', line)
+                    if m:
+                        self.summary["cuda_version"] = m.group(1)
+                        self.summary["cuda_available"] = True
 
             # Get detailed GPU information for all cards
             output = subprocess.run(
@@ -95,49 +100,41 @@ class GpuDetector:
             
             if "deviceName" in output:
                 self.summary["vulkan_available"] = True
-                
-                # Parse device names
+
+                # Single sequential pass: heapSize lines are associated with
+                # the most recent deviceName block, and the LARGEST heap in
+                # a device's block is its device-local VRAM. The old code
+                # collected names and heap sizes into independent flat lists
+                # and zipped them by index, mispairing heaps with devices on
+                # multi-GPU systems (vulkaninfo emits several heaps per
+                # device in no fixed count).
                 vulkan_devices = []
-                device_names = []
-                device_types = []
-                
+                current = None
                 for line in output.splitlines():
-                    if "deviceName" in line:
-                        name = line.split("=")[1].strip()
-                        device_names.append(name)
-                    if "deviceType" in line:
-                        device_type = line.split("=")[1].strip()
-                        is_discrete = "DISCRETE" in device_type
-                        device_types.append(is_discrete)
-                
-                vram_sizes = []
-                for line in output.splitlines():
-                    if "VkPhysicalDeviceMemoryProperties" in line or "heapSize" in line:
-                        # Look for memory heap sizes, typically in bytes
-                        if "heapSize" in line and "0x" in line:  # Hex value
-                            try:
-                                # Extract hex value and convert to bytes
-                                hex_value = line.split("0x")[1].split()[0]
-                                bytes_value = int(hex_value, 16)
-                                mb_value = bytes_value / (1024 * 1024)
-                                vram_sizes.append(int(mb_value))
-                            except Exception:
-                                pass
-                
-                for i in range(len(device_names)):
-                    device = {
-                        "name": device_names[i],
-                        "is_discrete": device_types[i] if i < len(device_types) else False
-                    }
-                    
-                    if i < len(vram_sizes):
-                        device["vram_mb"] = vram_sizes[i]
-                        # Update total VRAM if this is larger
-                        if vram_sizes[i] > self.summary["total_vram_mb"]:
-                            self.summary["total_vram_mb"] = vram_sizes[i]
-                    
-                    vulkan_devices.append(device)
-                
+                    if "deviceName" in line and "=" in line:
+                        if current is not None:
+                            vulkan_devices.append(current)
+                        current = {
+                            "name": line.split("=", 1)[1].strip(),
+                            "is_discrete": False,
+                            "vram_mb": 0,
+                        }
+                    elif current is not None and "deviceType" in line and "=" in line:
+                        current["is_discrete"] = "DISCRETE" in line.split("=", 1)[1]
+                    elif current is not None and "heapSize" in line and "0x" in line:
+                        try:
+                            hex_value = line.split("0x")[1].split()[0]
+                            mb_value = int(int(hex_value, 16) / (1024 * 1024))
+                            current["vram_mb"] = max(current["vram_mb"], mb_value)
+                        except Exception:
+                            pass
+                if current is not None:
+                    vulkan_devices.append(current)
+
+                for device in vulkan_devices:
+                    if device.get("vram_mb", 0) > self.summary["total_vram_mb"]:
+                        self.summary["total_vram_mb"] = device["vram_mb"]
+
                 self.summary["vulkan_devices"] = vulkan_devices
                 return True
             return False
@@ -336,7 +333,17 @@ def download_file(url, destination):
         
         if total_size > 0:
             sys.stdout.write('\n')
-        
+
+        # Integrity: a cleanly-closed-but-short stream does not raise, so a
+        # truncated multi-GB binary used to be accepted as a successful
+        # download and renamed into place.
+        if total_size > 0 and downloaded != total_size:
+            print(f"Error: incomplete download "
+                  f"({downloaded}/{total_size} bytes) — removing partial file")
+            if os.path.exists(destination):
+                os.remove(destination)
+            return False
+
         print(f"Download completed: {destination}")
         return True
     except Exception as e:
@@ -421,7 +428,14 @@ def determine_kobold_filename(gpu_summary):
     
     elif system == "Linux":
         if cuda_available:
-            major_version = float(cuda_version.split('.')[0])
+            try:
+                major_version = float(str(cuda_version).split('.')[0])
+            except (ValueError, TypeError, AttributeError):
+                # Malformed/missing version string — fall back to the
+                # compatibility build instead of crashing setup.
+                print(f"Could not parse CUDA version {cuda_version!r}; "
+                      f"using compatibility build.")
+                return "koboldcpp-linux-x64-oldpc"
             if major_version >= 12:
                 return "koboldcpp-linux-x64"
             else:
@@ -498,7 +512,23 @@ def download_kobold(gpu_summary, existing_executable):
             return final_path
         else:
             print("Failed to get version information from downloaded executable")
-            return temp_download_path
+            # Rename to a name the koboldcpp-* discovery glob can find and
+            # record a placeholder version — leaving it at the raw download
+            # name (e.g. koboldcpp.exe, no hyphen) made every subsequent
+            # launch re-download the multi-GB binary.
+            fallback_path = os.path.join(RESOURCES_DIR, f"koboldcpp-unknown{extension}")
+            try:
+                if existing_executable and os.path.exists(existing_executable):
+                    os.remove(existing_executable)
+                if os.path.exists(fallback_path):
+                    os.remove(fallback_path)
+                os.rename(temp_download_path, fallback_path)
+                with open(version_file, 'w') as f:
+                    f.write("unknown")
+                return fallback_path
+            except Exception as e:
+                print(f"Could not rename downloaded executable: {e}")
+                return temp_download_path
     else:
         print("Failed to download Kobold executable")
         if existing_executable:
@@ -1253,7 +1283,9 @@ def main():
     parser = argparse.ArgumentParser(description="Setup Utility for LLMII")
     parser.add_argument("--update", action="store_true", help="Install or Update KoboldCpp executable")
     parser.add_argument("--force-terminal", action="store_true", help="Force terminal mode even if display available")
-    parser.add_argument("--model", type=str, help="Specify model name for terminal mode")
+    parser.add_argument("--model", type=str,
+                        help="Specify model name (terminal mode only; the GUI "
+                             "setup uses its interactive picker and ignores this flag)")
     parser.add_argument("--detect-only", action="store_true", help="Only run GPU detection and exit")
     parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     parser.add_argument("--add-model", action="store_true", help="Add a custom model to the model list")
@@ -1275,6 +1307,7 @@ def main():
         return setup_terminal(args.update, args.model)
     else:
         return setup(args.update)
-    sys.exit()
+
+
 if __name__ == "__main__":
     sys.exit(main())
