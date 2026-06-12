@@ -381,6 +381,35 @@ def _chip_widget(tags, css=_IMG_CSS):
     return container
 
 
+class _ClickableImageChip(QLabel):
+    """Image-tag chip that attaches itself to the performer on double-click."""
+
+    def __init__(self, tag_id, tag_name, on_double_click, parent=None):
+        super().__init__(tag_name, parent)
+        self.tag_id = tag_id
+        self.tag_name = tag_name
+        self._on_double_click = on_double_click
+        self.setStyleSheet(_IMG_CSS)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"{tag_name}\nDouble-click to assign to this performer")
+
+    def mouseDoubleClickEvent(self, event):
+        if self._on_double_click:
+            self._on_double_click(self.tag_id, self.tag_name)
+
+
+def _clickable_chip_widget(rows, on_double_click, css=_IMG_CSS):
+    """Flow-layout of double-clickable image-tag chips.
+    rows: list of (tag_id, tag_name)."""
+    container = QWidget()
+    layout = FlowLayout(container, h_spacing=4, v_spacing=3)
+    container.setLayout(layout)
+    for tag_id, tag_name in sorted(rows, key=lambda r: r[1].casefold()):
+        layout.addWidget(_ClickableImageChip(tag_id, tag_name, on_double_click))
+    return container
+
+
 def _placeholder(text):
     lbl = QLabel(text)
     lbl.setStyleSheet("color: #999; font-size: 11px; padding: 6px;")
@@ -671,6 +700,14 @@ class ExplorePerformersWindow(QMainWindow):
         self.img_tag_stats_info.setStyleSheet("color: #888; font-size: 10px;")
         self.img_tag_stats_info.setWordWrap(True)
         atl.addWidget(self.img_tag_stats_info)
+
+        self._tag_stats_filter = ''
+        self.img_tag_stats_search = QLineEdit()
+        self.img_tag_stats_search.setPlaceholderText("Filter tags…")
+        self.img_tag_stats_search.setClearButtonEnabled(True)
+        self.img_tag_stats_search.textChanged.connect(self._on_tag_stats_filter)
+        atl.addWidget(self.img_tag_stats_search)
+
         self.img_tag_stats_list = QListWidget()
         self.img_tag_stats_list.setAlternatingRowColors(True)
         self.img_tag_stats_list.setStyleSheet(
@@ -1076,6 +1113,12 @@ class ExplorePerformersWindow(QMainWindow):
         self._sort_alpha_btn.setChecked(mode == 'alpha')
         self._render_tag_stats()
 
+    def _on_tag_stats_filter(self, text):
+        """Quick-filter the All Image Tags list by substring (re-renders the
+        cached rows; no DB query)."""
+        self._tag_stats_filter = (text or '').strip().lower()
+        self._render_tag_stats()
+
     def _render_tag_stats(self):
         """Re-render the All Image Tags list from the cached rows in the current sort order."""
         rows = list(getattr(self, '_tag_stats_rows', []))
@@ -1083,6 +1126,10 @@ class ExplorePerformersWindow(QMainWindow):
             rows.sort(key=lambda r: r[1].casefold())
         else:
             rows.sort(key=lambda r: (-r[2], r[1].casefold()))
+
+        needle = getattr(self, '_tag_stats_filter', '')
+        if needle:
+            rows = [r for r in rows if needle in r[1].lower()]
 
         self.img_tag_stats_list.clear()
         total_images = len(self._images)
@@ -1092,10 +1139,14 @@ class ExplorePerformersWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, (tag_id, tag_name))
             self.img_tag_stats_list.addItem(item)
 
-        n = len(rows)
-        self.img_tag_stats_hdr.setText(
-            f"All Image Tags  ({n})" if n else "All Image Tags"
-        )
+        total = len(getattr(self, '_tag_stats_rows', []))
+        shown = len(rows)
+        if needle and shown != total:
+            self.img_tag_stats_hdr.setText(f"All Image Tags  ({shown}/{total})")
+        else:
+            self.img_tag_stats_hdr.setText(
+                f"All Image Tags  ({total})" if total else "All Image Tags"
+            )
 
     def _on_tag_stats_double_click(self, item):
         """Double-clicking a tag in All Image Tags attaches it to the performer."""
@@ -1116,6 +1167,15 @@ class ExplorePerformersWindow(QMainWindow):
         act_global = menu.addAction(f"Blacklist '{tag_name}' for ALL performers")
         act_global.triggered.connect(lambda: self._exclude_tag_globally(tag_id, tag_name))
         menu.exec(self.img_tag_stats_list.mapToGlobal(pos))
+
+    def _attach_image_tag(self, tag_id, tag_name):
+        """Double-click handler for the current image's tag chips — assign
+        the tag to the performer being viewed."""
+        if self._current_pid is None:
+            return
+        self._attach_tag_from_stats(tag_id, tag_name)
+        self.statusBar().showMessage(
+            f"Assigned '{tag_name}' to {self._current_pname or 'performer'}", 4000)
 
     def _attach_tag_from_stats(self, tag_id, tag_name):
         if self._current_pid is None:
@@ -1309,13 +1369,13 @@ class ExplorePerformersWindow(QMainWindow):
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT DISTINCT t.tag
+                    SELECT DISTINCT t.id, t.tag
                     FROM   image_keywords ik
                     JOIN   tags t ON t.id = ik.tag_id
                     WHERE  ik.image_id = %s
                     ORDER  BY t.tag
                 """, (image_id,))
-                img_tags = [row[0] for row in cur.fetchall()]
+                img_tags = [(row[0], row[1]) for row in cur.fetchall()]
         except Exception as e:
             try:
                 self.conn.rollback()
@@ -1325,7 +1385,7 @@ class ExplorePerformersWindow(QMainWindow):
             img_tags = []
 
         self.img_tags_scroll.setWidget(
-            _chip_widget(img_tags, css=_IMG_CSS) if img_tags
+            _clickable_chip_widget(img_tags, self._attach_image_tag) if img_tags
             else _placeholder("No tags for this image")
         )
 
