@@ -2521,6 +2521,15 @@ class ImageIndexerGUI(QMainWindow):
             config.skip_folders = folders
 
         if self.indexer_thread is not None:
+            # Defensive backstop: never orphan a live QThread. Reassigning
+            # self.indexer_thread while the old one still runs drops its
+            # last reference and Qt aborts the process when it is GC'd.
+            if self.indexer_thread.isRunning():
+                self.indexer_thread.stopped = True
+                self.update_output("Waiting for the previous run to stop...")
+                if not self.indexer_thread.wait(10000):
+                    self.indexer_thread.terminate()
+                    self.indexer_thread.wait()
             try:
                 self.indexer_thread.output_received.disconnect()
                 self.indexer_thread.image_processed.disconnect()
@@ -2575,8 +2584,9 @@ class ImageIndexerGUI(QMainWindow):
     def stop_indexer(self):
         self.pause_handler.stop_signal.emit()
         self.update_output("Stopping indexer...")
-        self.run_button.setEnabled(True)
-        self.resume_button.setEnabled(True)
+        # Run/Resume stay disabled until indexer_finished() fires: the
+        # worker only stops at its next checkpoint, and starting a new run
+        # while the old QThread is still alive crashes the process.
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
