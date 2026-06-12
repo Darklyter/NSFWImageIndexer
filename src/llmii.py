@@ -2180,6 +2180,37 @@ class FileProcessor:
         self.callback(f"---")
         
     
+    def _test_writeability(self, file_path, metadata=None):
+        """Non-destructively check that output can be written for this file.
+
+        write_metadata only ever writes a JSON sidecar and/or a DB row —
+        never the image file itself — so the only thing worth probing is
+        the sidecar location. The previous probe called write_metadata
+        directly, which (a) overwrote any existing sidecar with empty
+        Description/Keywords/Identifier and (b) inserted XMP:Status='valid'
+        into image_run_status, violating its CHECK constraint and causing
+        every file with validation warnings to be skipped forever in db mode.
+        """
+        output_mode = getattr(self.config, 'output_mode', 'json')
+        if output_mode not in ('json', 'both'):
+            # DB writes have their own error handling and reconnect logic.
+            return True
+        if metadata is not None and metadata.get('_zip_db_key'):
+            sidecar_path = self._zip_sidecar_path(metadata['_zip_db_key'])
+        else:
+            sidecar_path = self._get_sidecar_path(file_path)
+        if os.path.exists(sidecar_path):
+            return os.access(sidecar_path, os.W_OK)
+        parent = os.path.dirname(sidecar_path) or '.'
+        # Parent may not exist yet (sidecar_dir / zip sidecar folder are
+        # created on first write) — walk up to the nearest existing dir.
+        while parent and not os.path.exists(parent):
+            new_parent = os.path.dirname(parent)
+            if new_parent == parent:
+                break
+            parent = new_parent
+        return os.access(parent or '.', os.W_OK)
+
     def process_file(self, metadata):
         """ Process a file and update its metadata in one operation.
             This minimizes the number of writes to the file.
@@ -2226,20 +2257,21 @@ class FileProcessor:
                     self.callback(f"---")
                     return
 
-                # If there are warnings, test if we can write to the file
-                # This prevents wasting LLM processing on unwritable files
-                if (warnings > 0) and (minor >= warnings):
+                # If there are warnings, check the output destination is
+                # writable so LLM processing isn't wasted on files whose
+                # results could never be saved.
+                if warnings > 0:
                     print(f"File has validation warnings: {os.path.basename(file_path)}")
                     print(f"  Warnings: {warnings}, Minor: {minor} - Testing writeability...")
-                    test_metadata = {"SourceFile": file_path, "XMP:Status": "valid"}
-                    if not self.write_metadata(file_path, test_metadata):
-                        print(f"  Metadata cannot be written to file")
-                        self.callback(f"\nMetadata is not writable: {file_path}")
+                    if not self._test_writeability(file_path, metadata):
+                        print(f"  Output destination is not writable")
+                        self.callback(f"\nOutput not writable for: {file_path}")
                         self.failed_validations.append(file_path)
                         self.callback(f"---")
                         return
-                    print(f"  File is writable - proceeding")
-                    # File is writable, update metadata to reflect valid status
+                    print(f"  Output is writable - proceeding")
+                    # In-memory marker only; never persisted (the DB status
+                    # CHECK constraint only allows success/failed/skipped).
                     metadata["XMP:Status"] = "valid"
 
             metadata = self.check_uuid(metadata, file_path)
