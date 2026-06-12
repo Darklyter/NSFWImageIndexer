@@ -382,31 +382,40 @@ def _chip_widget(tags, css=_IMG_CSS):
 
 
 class _ClickableImageChip(QLabel):
-    """Image-tag chip that attaches itself to the performer on double-click."""
+    """Image-tag chip that attaches itself to the performer on double-click.
 
-    def __init__(self, tag_id, tag_name, on_double_click, parent=None):
+    Green (_PERF_CSS) when the tag is already assigned to the performer,
+    blue (_IMG_CSS) otherwise.
+    """
+
+    def __init__(self, tag_id, tag_name, on_double_click, assigned=False, parent=None):
         super().__init__(tag_name, parent)
         self.tag_id = tag_id
         self.tag_name = tag_name
         self._on_double_click = on_double_click
-        self.setStyleSheet(_IMG_CSS)
+        self.setStyleSheet(_PERF_CSS if assigned else _IMG_CSS)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"{tag_name}\nDouble-click to assign to this performer")
+        self.setToolTip(
+            f"{tag_name}\nAlready assigned to this performer" if assigned
+            else f"{tag_name}\nDouble-click to assign to this performer")
 
     def mouseDoubleClickEvent(self, event):
         if self._on_double_click:
             self._on_double_click(self.tag_id, self.tag_name)
 
 
-def _clickable_chip_widget(rows, on_double_click, css=_IMG_CSS):
+def _clickable_chip_widget(rows, on_double_click, assigned_ids=None, css=_IMG_CSS):
     """Flow-layout of double-clickable image-tag chips.
-    rows: list of (tag_id, tag_name)."""
+    rows: list of (tag_id, tag_name); assigned_ids: set of tag_ids already
+    on the performer (shown green)."""
+    assigned_ids = assigned_ids or set()
     container = QWidget()
     layout = FlowLayout(container, h_spacing=4, v_spacing=3)
     container.setLayout(layout)
     for tag_id, tag_name in sorted(rows, key=lambda r: r[1].casefold()):
-        layout.addWidget(_ClickableImageChip(tag_id, tag_name, on_double_click))
+        layout.addWidget(_ClickableImageChip(
+            tag_id, tag_name, on_double_click, assigned=tag_id in assigned_ids))
     return container
 
 
@@ -502,6 +511,7 @@ class ExplorePerformersWindow(QMainWindow):
         self._all_performers = []   # [(id, name, total_images, processed_images), ...]
         self._images         = []   # [(image_id, path), ...]
         self._img_index      = 0
+        self._current_perf_tag_ids = set()  # tag_ids assigned to current performer
         self._current_pid    = None
         self._current_pname  = None
 
@@ -883,6 +893,10 @@ class ExplorePerformersWindow(QMainWindow):
             print(f"Error loading performer tags for {performer_id}: {e}")
             self.conn.rollback()
 
+        # Cache assigned tag ids so the current image's chips can show which
+        # are already on the performer (green).
+        self._current_perf_tag_ids = {r[0] for r in rows}
+
         if rows:
             threshold_count = sum(1 for _, _, pinned, manually in rows
                                   if not pinned and not manually)
@@ -1174,6 +1188,10 @@ class ExplorePerformersWindow(QMainWindow):
         if self._current_pid is None:
             return
         self._attach_tag_from_stats(tag_id, tag_name)
+        # _attach_tag_from_stats refreshed _current_perf_tag_ids; re-render the
+        # current image's chips so the just-assigned one turns green.
+        if self._images:
+            self._show_image(self._img_index)
         self.statusBar().showMessage(
             f"Assigned '{tag_name}' to {self._current_pname or 'performer'}", 4000)
 
@@ -1385,7 +1403,8 @@ class ExplorePerformersWindow(QMainWindow):
             img_tags = []
 
         self.img_tags_scroll.setWidget(
-            _clickable_chip_widget(img_tags, self._attach_image_tag) if img_tags
+            _clickable_chip_widget(img_tags, self._attach_image_tag,
+                                   assigned_ids=self._current_perf_tag_ids) if img_tags
             else _placeholder("No tags for this image")
         )
 
