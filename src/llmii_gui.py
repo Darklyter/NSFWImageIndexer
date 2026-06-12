@@ -262,7 +262,7 @@ class SettingsDialog(QDialog):
         self._on_lm_studio_toggled(False)
 
         system_instruction_layout = QHBoxLayout()
-        self.system_instruction_input = QLineEdit("You are a helpful assistant.")
+        self.system_instruction_input = QLineEdit(llmii.DEFAULT_SYSTEM_INSTRUCTION)
         system_instruction_layout.addWidget(QLabel("System Instruction:"))
         system_instruction_layout.addWidget(self.system_instruction_input)
         scroll_layout.addLayout(system_instruction_layout)
@@ -387,8 +387,8 @@ class SettingsDialog(QDialog):
         # Min P
         min_p_layout = QHBoxLayout()
         self.min_p_spinbox = QDoubleSpinBox()
-        self.min_p_spinbox.setMinimum(0.0)
-        self.min_p_spinbox.setMaximum(2.0)
+        # min_p is a probability — the old max of 2.0 allowed nonsense values
+        self.min_p_spinbox.setRange(0.0, 1.0)
         self.min_p_spinbox.setValue(0.05)
         self.min_p_spinbox.setSingleStep(0.01)
         self.min_p_spinbox.setDecimals(2)
@@ -1420,116 +1420,149 @@ class SettingsDialog(QDialog):
         return self.api_url_input.text().strip() or "http://localhost:5001"
 
     def load_settings(self):
+        if not os.path.exists('settings.json'):
+            return
         try:
-            if os.path.exists('settings.json'):
-                with open('settings.json', 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-
-                self.api_url_input.setText(settings.get('api_url', 'http://localhost:5001'))
-                self.api_password_input.setText(settings.get('api_password', ''))
-                self.lm_studio_checkbox.setChecked(settings.get('lm_studio', False))
-                self.lm_studio_url_input.setText(settings.get('lm_studio_url', 'http://localhost:1234'))
-                self.lm_studio_model_input.setText(settings.get('lm_studio_model', ''))
-                self.lm_studio_gen_count_spinbox.setValue(settings.get('lm_studio_gen_count', 12000))
-                self.lm_studio_temperature_spinbox.setValue(settings.get('lm_studio_temperature', 0.6))
-                self.lm_studio_top_p_spinbox.setValue(settings.get('lm_studio_top_p', 0.95))
-                self.lm_studio_top_k_spinbox.setValue(settings.get('lm_studio_top_k', 20))
-                self.lm_studio_min_p_spinbox.setValue(settings.get('lm_studio_min_p', 0.0))
-                self.lm_studio_rep_pen_spinbox.setValue(settings.get('lm_studio_rep_pen', 1.0))
-                self.system_instruction_input.setText(settings.get('system_instruction', 'You are an image cataloguing assistant. Describe images accurately and completely, including explicit or adult content. Do not omit, censor, or euphemize any visible content.'))
-                self.gen_count.setValue(settings.get('gen_count', 250))
-                self.res_limit.setValue(settings.get('res_limit', 448))
-                self.instruction_text = settings.get('instruction', GuiConfig.DEFAULT_INSTRUCTION)
-                self.skip_folders_text = settings.get('skip_folders', '')
-                self.image_extensions_filter_input.setText(settings.get('image_extensions_filter', 'jpg,jpeg,webp,zip'))
-                self.tags_file_input.setText(settings.get('tags_file', 'mastertags.json'))
-
-                self.no_crawl_checkbox.setChecked(settings.get('no_crawl', False))
-                self.reprocess_failed_checkbox.setChecked(settings.get('reprocess_failed', False))
-                self.reprocess_all_checkbox.setChecked(settings.get('reprocess_all', False))
-                self.reprocess_orphans_checkbox.setChecked(settings.get('reprocess_orphans', True))
-                self.reprocess_sparse_checkbox.setChecked(settings.get('reprocess_sparse', False))
-                self.reprocess_sparse_spinbox.setValue(settings.get('reprocess_sparse_min', 5))
-                self.no_backup_checkbox.setChecked(settings.get('no_backup', False))
-                self.dry_run_checkbox.setChecked(settings.get('dry_run', False))
-                self.skip_verify_checkbox.setChecked(settings.get('skip_verify', False))
-                self.quick_fail_checkbox.setChecked(settings.get('quick_fail', False))
-                self.rename_invalid_checkbox.setChecked(settings.get('rename_invalid', False))
-                self.preserve_date_checkbox.setChecked(settings.get('preserve_date', False))
-                self.fix_extension_checkbox.setChecked(settings.get('fix_extension', False))
-                #self.write_unsafe_checkbox.setChecked(settings.get('write_unsafe', False))
-                self.caption_instruction_input.setText(settings.get('caption_instruction', 'Describe the image in detail. Be specific.'))
-                self.tag_instruction_input.setText(settings.get('tag_instruction', 'Return a JSON object with key Keywords with the value as array of Keywords and tags that describe the image as follows: {"Keywords": []}'))
-                
-                # Set radio button based on settings
-                if settings.get('detailed_caption', False):
-                    self.detailed_caption_radio.setChecked(True)
-                elif settings.get('no_caption', False):
-                    self.no_caption_radio.setChecked(True)
-                else:
-                    # Default to short caption
-                    self.short_caption_radio.setChecked(True)
-                    
-                self.update_keywords_checkbox.setChecked(settings.get('update_keywords', True))
-                self.update_caption_checkbox.setChecked(settings.get('update_caption', False))
-                
-                # Load keyword correction settings
-                self.depluralize_checkbox.setChecked(settings.get('depluralize_keywords', False))
-                self.word_limit_checkbox.setChecked(settings.get('limit_word_count', True))
-                self.word_limit_spinbox.setValue(settings.get('max_words_per_keyword', 2))
-                self.split_and_checkbox.setChecked(settings.get('split_and_entries', True))
-                self.ban_prompt_words_checkbox.setChecked(settings.get('ban_prompt_words', True))
-                self.no_digits_start_checkbox.setChecked(settings.get('no_digits_start', True))
-                self.min_word_length_checkbox.setChecked(settings.get('min_word_length', True))
-                self.latin_only_checkbox.setChecked(settings.get('latin_only', True))
-                raw_bl = settings.get('tag_blacklist', '')
-                # Accept both old comma-separated and new newline-separated formats
-                if raw_bl and ',' in raw_bl and '\n' not in raw_bl:
-                    bl_lines = '\n'.join(w.strip() for w in raw_bl.split(',') if w.strip())
-                else:
-                    bl_lines = raw_bl
-                self.tag_blacklist_input.setPlainText(bl_lines)
-                self.tag_fuzzy_spinbox.setValue(settings.get('tag_fuzzy_threshold', 88))
-
-                # Load sampler settings
-                self.temperature_spinbox.setValue(settings.get('temperature', 0.2))
-                self.top_p_spinbox.setValue(settings.get('top_p', 1.0))
-                self.top_k_spinbox.setValue(settings.get('top_k', 100))
-                self.min_p_spinbox.setValue(settings.get('min_p', 0.05))
-                self.rep_pen_spinbox.setValue(settings.get('rep_pen', 1.01))
-
-                # Load JSON grammar setting
-                self.use_json_grammar_checkbox.setChecked(settings.get('use_json_grammar', False))
-
-                # Load sidecar location setting
-                sidecar_dir = settings.get('sidecar_dir', '')
-                if sidecar_dir:
-                    self.sidecar_custom_dir_radio.setChecked(True)
-                    self.sidecar_dir_input.setText(sidecar_dir)
-                else:
-                    self.sidecar_with_image_radio.setChecked(True)
-
-                # Load output mode
-                mode = settings.get('output_mode', 'json')
-                if mode == 'db':
-                    self.output_db_radio.setChecked(True)
-                elif mode == 'both':
-                    self.output_both_radio.setChecked(True)
-                else:
-                    self.output_json_radio.setChecked(True)
-
-                # Load database connection settings
-                self.db_host_input.setText(settings.get('db_host', 'localhost'))
-                self.db_port_input.setValue(settings.get('db_port', 5432))
-                self.db_user_input.setText(settings.get('db_user', ''))
-                self.db_pass_input.setText(settings.get('db_password', ''))
-                self.db_name_input.setText(settings.get('db_name', ''))
-
-                # Load zip temp folder setting
-                self.temp_folder_input.setText(settings.get('temp_folder', 'temp'))
-
+            with open('settings.json', 'r', encoding='utf-8') as f:
+                settings = json.load(f)
         except Exception as e:
-            print(f"Error loading settings: {e}")
+            print(f"Error reading settings.json: {e}")
+            QMessageBox.warning(
+                self, "Settings",
+                f"Could not read settings.json — using defaults.\n\n{e}")
+            return
+
+        # Per-key isolation: one wrong-typed value in a hand-edited
+        # settings.json used to abort the single try block mid-way,
+        # silently reverting every later widget to its default — and a
+        # subsequent Save then permanently overwrote settings.json with
+        # those defaults (including the detailed custom instructions).
+        failures = []
+
+        def _set(key, fn):
+            try:
+                fn()
+            except Exception as e:
+                failures.append(f"{key}: {e}")
+
+        _set('api_url', lambda: self.api_url_input.setText(settings.get('api_url', 'http://localhost:5001')))
+        _set('api_password', lambda: self.api_password_input.setText(settings.get('api_password', '')))
+        _set('lm_studio', lambda: self.lm_studio_checkbox.setChecked(settings.get('lm_studio', False)))
+        _set('lm_studio_url', lambda: self.lm_studio_url_input.setText(settings.get('lm_studio_url', 'http://localhost:1234')))
+        _set('lm_studio_model', lambda: self.lm_studio_model_input.setText(settings.get('lm_studio_model', '')))
+        _set('lm_studio_gen_count', lambda: self.lm_studio_gen_count_spinbox.setValue(settings.get('lm_studio_gen_count', 12000)))
+        _set('lm_studio_temperature', lambda: self.lm_studio_temperature_spinbox.setValue(settings.get('lm_studio_temperature', 0.6)))
+        _set('lm_studio_top_p', lambda: self.lm_studio_top_p_spinbox.setValue(settings.get('lm_studio_top_p', 0.95)))
+        _set('lm_studio_top_k', lambda: self.lm_studio_top_k_spinbox.setValue(settings.get('lm_studio_top_k', 20)))
+        _set('lm_studio_min_p', lambda: self.lm_studio_min_p_spinbox.setValue(settings.get('lm_studio_min_p', 0.0)))
+        _set('lm_studio_rep_pen', lambda: self.lm_studio_rep_pen_spinbox.setValue(settings.get('lm_studio_rep_pen', 1.0)))
+        _set('system_instruction', lambda: self.system_instruction_input.setText(settings.get('system_instruction', llmii.DEFAULT_SYSTEM_INSTRUCTION)))
+        _set('gen_count', lambda: self.gen_count.setValue(settings.get('gen_count', 250)))
+        _set('res_limit', lambda: self.res_limit.setValue(settings.get('res_limit', 448)))
+
+        def _load_instruction():
+            self.instruction_text = settings.get('instruction', GuiConfig.DEFAULT_INSTRUCTION)
+        _set('instruction', _load_instruction)
+
+        def _load_skip_folders():
+            self.skip_folders_text = settings.get('skip_folders', '')
+        _set('skip_folders', _load_skip_folders)
+
+        _set('image_extensions_filter', lambda: self.image_extensions_filter_input.setText(settings.get('image_extensions_filter', 'jpg,jpeg,webp,zip')))
+        _set('tags_file', lambda: self.tags_file_input.setText(settings.get('tags_file', 'mastertags.json')))
+
+        _set('no_crawl', lambda: self.no_crawl_checkbox.setChecked(settings.get('no_crawl', False)))
+        _set('reprocess_failed', lambda: self.reprocess_failed_checkbox.setChecked(settings.get('reprocess_failed', False)))
+        _set('reprocess_all', lambda: self.reprocess_all_checkbox.setChecked(settings.get('reprocess_all', False)))
+        _set('reprocess_orphans', lambda: self.reprocess_orphans_checkbox.setChecked(settings.get('reprocess_orphans', True)))
+        _set('reprocess_sparse', lambda: self.reprocess_sparse_checkbox.setChecked(settings.get('reprocess_sparse', False)))
+        _set('reprocess_sparse_min', lambda: self.reprocess_sparse_spinbox.setValue(settings.get('reprocess_sparse_min', 5)))
+        _set('no_backup', lambda: self.no_backup_checkbox.setChecked(settings.get('no_backup', False)))
+        _set('dry_run', lambda: self.dry_run_checkbox.setChecked(settings.get('dry_run', False)))
+        _set('skip_verify', lambda: self.skip_verify_checkbox.setChecked(settings.get('skip_verify', False)))
+        _set('quick_fail', lambda: self.quick_fail_checkbox.setChecked(settings.get('quick_fail', False)))
+        _set('rename_invalid', lambda: self.rename_invalid_checkbox.setChecked(settings.get('rename_invalid', False)))
+        _set('preserve_date', lambda: self.preserve_date_checkbox.setChecked(settings.get('preserve_date', False)))
+        _set('fix_extension', lambda: self.fix_extension_checkbox.setChecked(settings.get('fix_extension', False)))
+        _set('caption_instruction', lambda: self.caption_instruction_input.setText(settings.get('caption_instruction', 'Describe the image in detail. Be specific.')))
+        _set('tag_instruction', lambda: self.tag_instruction_input.setText(settings.get('tag_instruction', 'Return a JSON object with key Keywords with the value as array of Keywords and tags that describe the image as follows: {"Keywords": []}')))
+
+        def _load_caption_mode():
+            if settings.get('detailed_caption', False):
+                self.detailed_caption_radio.setChecked(True)
+            elif settings.get('no_caption', False):
+                self.no_caption_radio.setChecked(True)
+            else:
+                self.short_caption_radio.setChecked(True)
+        _set('caption_mode', _load_caption_mode)
+
+        _set('update_keywords', lambda: self.update_keywords_checkbox.setChecked(settings.get('update_keywords', True)))
+        _set('update_caption', lambda: self.update_caption_checkbox.setChecked(settings.get('update_caption', False)))
+
+        _set('depluralize_keywords', lambda: self.depluralize_checkbox.setChecked(settings.get('depluralize_keywords', False)))
+        _set('limit_word_count', lambda: self.word_limit_checkbox.setChecked(settings.get('limit_word_count', True)))
+        _set('max_words_per_keyword', lambda: self.word_limit_spinbox.setValue(settings.get('max_words_per_keyword', 2)))
+        _set('split_and_entries', lambda: self.split_and_checkbox.setChecked(settings.get('split_and_entries', True)))
+        _set('ban_prompt_words', lambda: self.ban_prompt_words_checkbox.setChecked(settings.get('ban_prompt_words', True)))
+        _set('no_digits_start', lambda: self.no_digits_start_checkbox.setChecked(settings.get('no_digits_start', True)))
+        _set('min_word_length', lambda: self.min_word_length_checkbox.setChecked(settings.get('min_word_length', True)))
+        _set('latin_only', lambda: self.latin_only_checkbox.setChecked(settings.get('latin_only', True)))
+
+        def _load_blacklist():
+            raw_bl = settings.get('tag_blacklist', '')
+            # Accept both old comma-separated and new newline-separated formats
+            if raw_bl and ',' in raw_bl and '\n' not in raw_bl:
+                bl_lines = '\n'.join(w.strip() for w in raw_bl.split(',') if w.strip())
+            else:
+                bl_lines = raw_bl
+            self.tag_blacklist_input.setPlainText(bl_lines)
+        _set('tag_blacklist', _load_blacklist)
+
+        _set('tag_fuzzy_threshold', lambda: self.tag_fuzzy_spinbox.setValue(settings.get('tag_fuzzy_threshold', 88)))
+
+        _set('temperature', lambda: self.temperature_spinbox.setValue(settings.get('temperature', 0.2)))
+        _set('top_p', lambda: self.top_p_spinbox.setValue(settings.get('top_p', 1.0)))
+        _set('top_k', lambda: self.top_k_spinbox.setValue(settings.get('top_k', 100)))
+        _set('min_p', lambda: self.min_p_spinbox.setValue(settings.get('min_p', 0.05)))
+        _set('rep_pen', lambda: self.rep_pen_spinbox.setValue(settings.get('rep_pen', 1.01)))
+
+        _set('use_json_grammar', lambda: self.use_json_grammar_checkbox.setChecked(settings.get('use_json_grammar', False)))
+
+        def _load_sidecar():
+            sidecar_dir = settings.get('sidecar_dir', '')
+            if sidecar_dir:
+                self.sidecar_custom_dir_radio.setChecked(True)
+                self.sidecar_dir_input.setText(sidecar_dir)
+            else:
+                self.sidecar_with_image_radio.setChecked(True)
+        _set('sidecar_dir', _load_sidecar)
+
+        def _load_output_mode():
+            mode = settings.get('output_mode', 'json')
+            if mode == 'db':
+                self.output_db_radio.setChecked(True)
+            elif mode == 'both':
+                self.output_both_radio.setChecked(True)
+            else:
+                self.output_json_radio.setChecked(True)
+        _set('output_mode', _load_output_mode)
+
+        _set('db_host', lambda: self.db_host_input.setText(settings.get('db_host', 'localhost')))
+        _set('db_port', lambda: self.db_port_input.setValue(settings.get('db_port', 5432)))
+        _set('db_user', lambda: self.db_user_input.setText(settings.get('db_user', '')))
+        _set('db_password', lambda: self.db_pass_input.setText(settings.get('db_password', '')))
+        _set('db_name', lambda: self.db_name_input.setText(settings.get('db_name', '')))
+
+        _set('temp_folder', lambda: self.temp_folder_input.setText(settings.get('temp_folder', 'temp')))
+
+        if failures:
+            msg = ("Some settings could not be loaded and kept their defaults:\n  • "
+                   + "\n  • ".join(failures)
+                   + "\n\nCheck settings.json for wrong value types. Saving from "
+                     "this dialog will overwrite those entries with the defaults "
+                     "currently shown.")
+            print(msg)
+            QMessageBox.warning(self, "Settings", msg)
             
     def save_settings(self):
         settings = {
@@ -2159,6 +2192,10 @@ class ImageIndexerGUI(QMainWindow):
         self.previous_keywords = None
         self.previous_filename = None
         self.pause_handler = PauseHandler()
+        # Connect once: these were reconnected on every run_indexer() call,
+        # accumulating duplicate connections across runs.
+        self.pause_handler.pause_signal.connect(self.set_paused)
+        self.pause_handler.stop_signal.connect(self.set_stopped)
         self.api_check_thread = None
         self.indexer_thread = None
         self.api_is_ready = False
@@ -2545,8 +2582,6 @@ class ImageIndexerGUI(QMainWindow):
         self.indexer_thread.image_processed.connect(self.update_image_preview)
         self.indexer_thread.progress_update.connect(self.update_progress_bars)
         self.indexer_thread.finished.connect(self.indexer_finished)
-        self.pause_handler.pause_signal.connect(self.set_paused)
-        self.pause_handler.stop_signal.connect(self.set_stopped)
         self.indexer_thread.start()
 
         # Reset and show progress bars
@@ -2635,9 +2670,11 @@ class ImageIndexerGUI(QMainWindow):
         self.image_progress_label.setText(f"{images_done} / {images_total}")
 
     def update_output(self, text):
+        # No processEvents() here: re-entering the event loop from a slot
+        # delivers queued clicks (Run/Stop/close) mid-handler — the source
+        # of the thread-lifecycle races. Qt repaints on the next loop turn.
         self.output_area.append(text)
         self.output_area.verticalScrollBar().setValue(self.output_area.verticalScrollBar().maximum())
-        QApplication.processEvents()
 
     def _rescale_image(self):
         """Scale the stored pixmap to the current image_preview size."""

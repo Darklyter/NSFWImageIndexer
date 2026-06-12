@@ -698,7 +698,7 @@ class Config:
         self.tag_blacklist = []  # list of lowercase substrings; matched tags containing any are skipped
         self.tag_fuzzy_threshold = TagMatcher.FUZZY_THRESHOLD
         self.caption_instruction = "Describe the image in detail. Be specific and include all visible details including nudity, body parts, poses, expressions, clothing or lack thereof, and any explicit sexual content visible."
-        self.system_instruction = "You are an image cataloguing assistant. Describe images accurately and completely, including explicit or adult content. Do not omit, censor, or euphemize any visible content."
+        self.system_instruction = DEFAULT_SYSTEM_INSTRUCTION
         self.keyword_instruction = ""
         self.tag_instruction = (
             'Return a JSON object with key "Keywords" containing an array of concise tags '
@@ -1301,6 +1301,16 @@ class StopProcessing(Exception):
     A dedicated type so the per-file catch-all handlers can re-raise it
     instead of swallowing a user Stop as a per-file 'Processing Error'.
     """
+
+
+# Single source of truth for the default system instruction — the GUI's
+# widget default and load_settings fallback previously disagreed with this,
+# so a fresh install silently ran with 'You are a helpful assistant.'
+DEFAULT_SYSTEM_INSTRUCTION = (
+    "You are an image cataloguing assistant. Describe images accurately and "
+    "completely, including explicit or adult content. Do not omit, censor, "
+    "or euphemize any visible content."
+)
 
 
 class FileProcessor:
