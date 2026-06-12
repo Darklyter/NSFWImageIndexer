@@ -1333,6 +1333,12 @@ class FileProcessor:
         """ Rename a file to filename_ext.invalid
             Returns True if successful, False otherwise
         """
+        if self.config.dry_run:
+            # Pretend mode must not touch the filesystem (this method also
+            # deletes _original backups and exiftool temp files).
+            print(f"Dry run: would rename invalid file: {os.path.basename(file_path)}")
+            self.callback(f"Dry run: would rename invalid file: {os.path.basename(file_path)}")
+            return False
         try:
             # Clean up any exiftool temporary and backup files first
             dir_name = os.path.dirname(file_path)
@@ -1501,6 +1507,10 @@ class FileProcessor:
 
         # If they match, no change needed
         if current_ext == expected_ext:
+            return file_path
+
+        if self.config.dry_run:
+            print(f"Dry run: would rename {os.path.basename(file_path)} to extension {expected_ext}")
             return file_path
 
         try:
@@ -2330,9 +2340,11 @@ class FileProcessor:
                 self.callback(f"Retry failed due to AI for {file_path}")
                 self.callback(f"---")
                 metadata["XMP:Status"] = "failed"
-                
+                # A failed generation is a failure in dry run too — the old
+                # placement inside the dry_run check made pretend mode report
+                # failed files as successful completions.
+                success = False
                 if not self.config.dry_run:
-                    success = False
                     self.write_metadata(file_path, metadata)
                 
                 
