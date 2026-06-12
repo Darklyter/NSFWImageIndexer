@@ -107,6 +107,23 @@ class TestCleanTags:
     def test_raw_list_still_works(self):
         assert clean_tags(["a", "b", "a"])["Keywords"] == ["a", "b"]
 
+    def test_array_of_tag_objects_salvaged(self):
+        # Exact failure shape from production kobold.log: the model answered
+        # 'return a JSON array of strings' with per-item {"tag": ...} objects
+        data = [
+            {"tag": "multicolored dreadlocks"},
+            {"tag": "long hair"},
+            {"tag": "light skin"},
+            {"tag": "slim"},
+        ]
+        result = clean_tags(data)
+        assert result["Keywords"] == [
+            "multicolored dreadlocks", "long hair", "light skin", "slim"]
+
+    def test_mixed_strings_and_tag_objects(self):
+        result = clean_tags(["fair skin", {"keyword": "tattoo"}, {"name": "boots"}])
+        assert result["Keywords"] == ["fair skin", "tattoo", "boots"]
+
 
 class TestCoerceKeywordList:
     def test_none(self):

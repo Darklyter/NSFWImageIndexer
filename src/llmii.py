@@ -352,12 +352,26 @@ def clean_tags(data):
                 deduped = [k for k in coerced if not (k.lower() in seen or seen.add(k.lower()))][:30]
                 return {"Keywords": deduped}
             return None
-        # List of dicts - extract Keywords from each
+        # List of dicts - extract Keywords from each. Models sometimes
+        # answer "return a JSON array of strings" with per-item objects
+        # like [{"tag": "long hair"}, ...] — salvage the string values.
         for item in data:
             if isinstance(item, dict):
                 keywords = _coerce_keyword_list(item.get("Keywords", []))
+                if not keywords:
+                    for key in ("keywords", "tag", "tags", "keyword", "name", "value"):
+                        if key in item:
+                            keywords = _coerce_keyword_list(item[key])
+                            break
+                if not keywords:
+                    # Single string-valued entry: take the value
+                    str_vals = [v for v in item.values() if isinstance(v, str)]
+                    if len(str_vals) == 1:
+                        keywords = _coerce_keyword_list(str_vals)
                 if keywords:
                     all_keywords.extend(keywords)
+            elif isinstance(item, str) and item.strip():
+                all_keywords.append(item.strip())
         return {"Keywords": all_keywords} if all_keywords else None
 
     if isinstance(data, str):
@@ -1034,7 +1048,7 @@ class LLMProcessor:
                             "strict": False
                         }
                     }
-            elif self.use_json_grammar and task in ["caption_and_keywords", "keywords", "keywords_from_text"]:
+            elif self.use_json_grammar and task in ["caption_and_keywords", "keywords"]:
                 if task == "caption_and_keywords":
                     # KoboldCpp schema for both description and keywords
                     payload["response_format"] = {
@@ -1055,11 +1069,14 @@ class LLMProcessor:
                             "required": ["Description", "Keywords"]
                         }
                     }
-                elif task in ("keywords", "keywords_from_text"):
-                    # KoboldCpp schema for keywords only. keywords_from_text
-                    # (stage 2 of the detailed-caption pipeline) uses the
-                    # same shape — it was listed in the outer condition but
-                    # fell through both branches and ran unconstrained.
+                elif task == "keywords":
+                    # KoboldCpp schema for keywords only.
+                    # NOTE: deliberately NOT applied to keywords_from_text —
+                    # the user's tag_instruction asks for a bare JSON array,
+                    # and forcing the {"Keywords": ...} object grammar onto
+                    # that task pushed the model into emitting
+                    # [{"tag": ...}] hybrids that parsed to zero keywords
+                    # (those images failed permanently after retry).
                     payload["response_format"] = {
                         "type": "json_object",
                         "schema": {
