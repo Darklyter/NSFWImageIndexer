@@ -710,6 +710,7 @@ class Config:
         self.min_word_length = True
         self.latin_only = True
         self.tag_blacklist = []  # list of lowercase substrings; matched tags containing any are skipped
+        self.keyword_blacklist = []  # exact model-output keywords dropped before unmatched logging (objects/props)
         self.tag_fuzzy_threshold = TagMatcher.FUZZY_THRESHOLD
         self.caption_instruction = "Describe the image in detail. Be specific and include all visible details including nudity, body parts, poses, expressions, clothing or lack thereof, and any explicit sexual content visible."
         self.system_instruction = DEFAULT_SYSTEM_INSTRUCTION
@@ -3055,6 +3056,11 @@ class FileProcessor:
         """
         all_keywords = set()
         blacklist = [w.strip().lower() for w in self.config.tag_blacklist if w.strip()]
+        # Exact-match keyword blacklist: model output equal to one of these
+        # (objects/props/settings the user never wants) is dropped silently,
+        # before it can be logged to the unmatched table for review.
+        kw_blacklist = {w.strip().lower() for w in
+                        getattr(self.config, 'keyword_blacklist', []) if w.strip()}
 
         # Hard cap: no alias in either tag file is longer than 5 words.
         # Keywords exceeding this are combinatorial garbage from the LLM and
@@ -3437,6 +3443,11 @@ class FileProcessor:
             (stashdb_tags.json). Logs matched entries with their source; logs
             unmatched entries only when both sources fail.
             """
+            # Drop blacklisted keywords silently (no unmatched logging) —
+            # objects/props/settings the user has explicitly rejected.
+            if keyword.strip().lower() in kw_blacklist:
+                return None
+
             # Drop keywords that describe absent attributes ("no X", "not X", "without X")
             if _NEGATIVE_RE.match(keyword.strip()):
                 return None

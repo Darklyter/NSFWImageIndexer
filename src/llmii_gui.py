@@ -2558,6 +2558,14 @@ class ImageIndexerGUI(QMainWindow):
         config.latin_only = self.settings_dialog.latin_only_checkbox.isChecked()
         raw_blacklist = self.settings_dialog.tag_blacklist_input.toPlainText()
         config.tag_blacklist = [w.strip() for w in raw_blacklist.splitlines() if w.strip()]
+        # keyword_blacklist is a large, machine-managed list (object/prop terms
+        # rejected via tag-reconcile) — read straight from settings.json rather
+        # than a GUI textarea.
+        try:
+            with open('settings.json', encoding='utf-8') as _kbf:
+                config.keyword_blacklist = json.load(_kbf).get('keyword_blacklist', [])
+        except Exception:
+            config.keyword_blacklist = []
         config.tag_fuzzy_threshold = self.settings_dialog.tag_fuzzy_spinbox.value()
         
         # Load caption settings

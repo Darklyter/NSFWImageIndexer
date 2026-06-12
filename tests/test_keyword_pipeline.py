@@ -196,3 +196,15 @@ class TestProcessKeywords:
         fp.config.tag_blacklist = ["watermark"]
         result = fp.process_keywords({}, ["watermark"])
         assert result == []
+
+    def test_keyword_blacklist_drops_silently(self):
+        fp = make_fp()
+        fp.config.keyword_blacklist = ["toy gun", "popcorn"]
+        unmatched = []
+        fp.tag_matcher.log_unmatched = lambda kw: unmatched.append(kw)
+        result, debug = fp.process_keywords(
+            {}, ["toy gun", "popcorn", "Long Hair"], return_debug=True)
+        # blacklisted terms produce no tag AND are not logged to unmatched
+        assert "toy gun" not in result and "popcorn" not in result
+        assert "toy gun" not in unmatched and "popcorn" not in unmatched
+        assert debug["toy gun"] is None
