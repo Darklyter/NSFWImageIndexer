@@ -387,7 +387,7 @@ _DDL = [
             error_message text,
             PRIMARY KEY (image_id, tagger_run_id),
             CONSTRAINT image_run_status_status_check
-                CHECK (status = ANY (ARRAY['success','failed','skipped'])),
+                CHECK (status = ANY (ARRAY['success','failed','skipped','invalid'])),
             CONSTRAINT image_run_status_image_id_fkey
                 FOREIGN KEY (image_id)      REFERENCES ai_captioning.images(id)      ON DELETE CASCADE,
             CONSTRAINT image_run_status_tagger_run_id_fkey

@@ -357,6 +357,16 @@ def apply_migrations(conn):
         # the same hash). Drop it and index the column for the GROUP BY.
         "ALTER TABLE images DROP CONSTRAINT IF EXISTS images_sha256_key",
         "CREATE INDEX IF NOT EXISTS images_sha256_idx ON images (sha256) WHERE sha256 IS NOT NULL",
+        # 'invalid' status: files that failed ExifTool validation are now
+        # recorded so they aren't re-validated on every run.
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE image_run_status DROP CONSTRAINT IF EXISTS image_run_status_status_check;
+            ALTER TABLE image_run_status ADD CONSTRAINT image_run_status_status_check
+                CHECK (status = ANY (ARRAY['success','failed','skipped','invalid']));
+        END $$
+        """,
     ]
     # Each migration runs under its own SAVEPOINT so one failing statement
     # (e.g. on a partially-built or divergent schema) neither aborts the

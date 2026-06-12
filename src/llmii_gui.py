@@ -1677,7 +1677,9 @@ class IndexerThread(QThread):
 
     def check_paused_or_stopped(self):
         if self.stopped:
-            raise Exception("Indexer stopped by user")
+            # Dedicated type so llmii's per-file handlers re-raise it
+            # instead of reporting the Stop as a per-file error.
+            raise llmii.StopProcessing("Indexer stopped by user")
         if self.paused:
             while self.paused and not self.stopped:
                 self.msleep(100)

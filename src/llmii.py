@@ -1168,56 +1168,84 @@ class BackgroundIndexer(threading.Thread):
         self.indexing_complete = False
         self.chunk_size = chunk_size
         self.last_processed_dir = None
+        # Cooperative cancellation: Stop used to have no effect on the
+        # crawler, which kept walking (and stat-ing) the whole tree while
+        # main() blocked in an untimed join(). daemon=True additionally
+        # guarantees the process can exit even if the crawl is stuck on a
+        # dead network share.
+        self.stop_event = threading.Event()
+        self.daemon = True
+
+    def stop(self):
+        self.stop_event.set()
 
     def _should_skip_directory(self, directory):
         """Check if directory should be skipped based on skip_folders list"""
         if not self.skip_folders:
             return False
 
-        # Normalize the directory path
-        dir_normalized = os.path.normpath(directory)
+        # Normalize the directory path (case-folded: Windows paths)
+        dir_normalized = os.path.normcase(os.path.normpath(directory))
+        dir_parts = [p for p in dir_normalized.split(os.sep) if p]
 
         for skip_folder in self.skip_folders:
-            skip_normalized = os.path.normpath(skip_folder)
+            skip_normalized = os.path.normcase(os.path.normpath(skip_folder))
 
-            # Check if it's a full path match
-            if dir_normalized == skip_normalized:
+            # Full-path entry: match the path itself or anything inside it
+            if (dir_normalized == skip_normalized
+                    or dir_normalized.startswith(skip_normalized + os.sep)):
                 return True
 
-            # Check if it's a relative path from root_dir
-            relative_skip = os.path.normpath(os.path.join(self.root_dir, skip_folder))
-            if dir_normalized == relative_skip:
+            # Relative-path entry resolved against root_dir
+            relative_skip = os.path.normcase(
+                os.path.normpath(os.path.join(self.root_dir, skip_folder)))
+            if (dir_normalized == relative_skip
+                    or dir_normalized.startswith(relative_skip + os.sep)):
                 return True
 
-            # Check if the directory contains the skip folder in its path
-            if skip_normalized in dir_normalized or os.path.basename(dir_normalized) == os.path.basename(skip_normalized):
+            # Bare-name entry: match as a whole path COMPONENT. The old
+            # bare substring test made skip_folders=['old'] silently skip
+            # 'C:\photos\golden'.
+            if os.sep not in skip_normalized and skip_normalized in dir_parts:
                 return True
 
         return False
             
     def run(self):
-        if self.no_crawl:
-            if not self._should_skip_directory(self.root_dir):
-                self.total_directories = 1
-                print(f"Indexing directory (no crawl): {self.root_dir}")
-                self._index_directory(self.root_dir)
-        else:
-            # Get ordered list of directories to process
-            directories = []
-            for root, _, _ in os.walk(self.root_dir):
-                dir_path = os.path.normpath(root)
-                if not self._should_skip_directory(dir_path):
+        # try/finally: indexing_complete MUST be set even if the crawl
+        # raises, otherwise the consumer loop in process_directory waits
+        # on the queue forever.
+        try:
+            if self.no_crawl:
+                if not self._should_skip_directory(self.root_dir):
+                    self.total_directories = 1
+                    print(f"Indexing directory (no crawl): {self.root_dir}")
+                    self._index_directory(self.root_dir)
+            else:
+                # Get ordered list of directories to process
+                directories = []
+                for root, dirs, _ in os.walk(self.root_dir):
+                    if self.stop_event.is_set():
+                        return
+                    dir_path = os.path.normpath(root)
+                    if self._should_skip_directory(dir_path):
+                        # Prune: don't descend into skipped directories
+                        dirs[:] = []
+                        continue
                     directories.append(dir_path)
 
-            directories.sort()
-            self.total_directories = len(directories)
-            print(f"Found {len(directories)} director(ies) to index")
+                directories.sort()
+                self.total_directories = len(directories)
+                print(f"Found {len(directories)} director(ies) to index")
 
-            for directory in directories:
-                self._index_directory(directory)
+                for directory in directories:
+                    if self.stop_event.is_set():
+                        return
+                    self._index_directory(directory)
 
-        print(f"Indexing complete. Total files found: {self.total_files_found}")
-        self.indexing_complete = True
+            print(f"Indexing complete. Total files found: {self.total_files_found}")
+        finally:
+            self.indexing_complete = True
 
     def _index_directory(self, directory):
         """Process directory in chunks"""
@@ -1226,6 +1254,8 @@ class BackgroundIndexer(threading.Thread):
         
         try:
             for filename in sorted(os.listdir(directory)):
+                if self.stop_event.is_set():
+                    return
                 file_path = os.path.normpath(os.path.join(directory, filename))
                 
                 # Skip if not a valid file type
@@ -1263,6 +1293,14 @@ class BackgroundIndexer(threading.Thread):
 # Sentinel stored in debug_map when a keyword matched a tag but that tag is blacklisted.
 # Distinct from None (unmatched) so callers can colour it differently.
 _BLACKLISTED = "__blacklisted__"
+
+
+class StopProcessing(Exception):
+    """Raised by the pause/stop callback to unwind processing cleanly.
+
+    A dedicated type so the per-file catch-all handlers can re-raise it
+    instead of swallowing a user Stop as a per-file 'Processing Error'.
+    """
 
 
 class FileProcessor:
@@ -1308,6 +1346,9 @@ class FileProcessor:
             'mode':         'dir',  # 'dir' → images bar shows directory images
                                     # 'zip' → images bar shows current zip images
         }
+        # Distinct directories seen on the queue (each directory arrives as
+        # multiple chunk batches; see process_directory progress handling).
+        self._progress_seen_dirs = set()
 
         # Database connection (populated below if output_mode includes 'db')
         self.db_conn   = None
@@ -1315,6 +1356,7 @@ class FileProcessor:
         # Set to True when a DB connection loss cannot be recovered; causes
         # check_pause_stop() to return True so the run stops cleanly.
         self._db_fatal = False
+        self._stop_requested = False
 
         if getattr(config, 'output_mode', 'json') in ('db', 'both'):
             try:
@@ -1404,7 +1446,7 @@ class FileProcessor:
             "Composite:Description",
             "Caption",
             "IPTC:Caption",
-            "Composite:Caption"
+            "Composite:Caption",
             "IPTC:Caption-Abstract",
             "XMP-dc:Description",
             "PNG:Description"
@@ -1683,7 +1725,12 @@ class FileProcessor:
                 'files_processed': self.files_processed,
                 'processed_paths': list(self._checkpoint_paths),
             }
-            _checkpoint_path().write_text(json.dumps(data), encoding='utf-8')
+            # Atomic write: a crash mid-write must not corrupt the
+            # checkpoint that resume depends on.
+            cp = _checkpoint_path()
+            tmp = cp.with_suffix(cp.suffix + '.tmp')
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(tmp, cp)
         except Exception as e:
             print(f"Warning: checkpoint write failed: {e}")
 
@@ -1722,6 +1769,10 @@ class FileProcessor:
                         self._progress['dirs_total'],
                         self.indexer.total_directories,
                     )
+                    # Directories are enqueued in multiple ≤chunk_size
+                    # batches; counting batches made the bar overshoot its
+                    # total. Count distinct directories instead.
+                    self._progress_seen_dirs.add(directory)
                     self._progress['zips_total']   = len(zip_files)
                     self._progress['zips_done']    = 0
                     self._progress['mode']         = 'dir'
@@ -1758,13 +1809,16 @@ class FileProcessor:
                             self._progress['zips_done'] += 1
                             self._emit_progress()
 
-                    self._progress['dirs_done'] += 1
+                    self._progress['dirs_done'] = len(self._progress_seen_dirs)
                     self._emit_progress()
                     self.update_progress()
 
                 except queue.Empty:
                     continue
             self._run_completed_normally = True
+        except StopProcessing:
+            self._stop_requested = True
+            raise
         finally:
             try:
                 self.et.terminate()
@@ -1788,9 +1842,18 @@ class FileProcessor:
 
             if self.db_conn and self.db_run_id:
                 try:
-                    llmii_db.finish_tagger_run(self.db_conn, self.db_run_id, status='success')
+                    # Record the run's true outcome — every run (stopped,
+                    # crashed, db-fatal) used to be marked 'success'.
+                    if self._run_completed_normally:
+                        run_status = 'success'
+                    elif self._stop_requested and not self._db_fatal:
+                        run_status = 'cancelled'
+                    else:
+                        run_status = 'failed'
+                    llmii_db.finish_tagger_run(self.db_conn, self.db_run_id,
+                                               status=run_status)
                     self.db_conn.close()
-                    print("Database connection closed.")
+                    print(f"Database connection closed (run status: {run_status}).")
                 except Exception as e:
                     print(f"Warning: DB teardown error: {e}")
 
@@ -1953,12 +2016,15 @@ class FileProcessor:
                 for info in to_extract:
                     composite_key = composites[info.filename]
                     try:
-                        zf.extract(info, zip_temp_dir)
+                        # Use the path extract() actually wrote: zipfile
+                        # sanitizes member names (Windows-illegal chars,
+                        # '..' components, absolute paths), so computing
+                        # the path from the raw member name can point at a
+                        # file that doesn't exist.
+                        temp_file = zf.extract(info, zip_temp_dir)
                     except Exception as e:
                         print(f"  Extract error ({info.filename} from {zip_source_name}): {e}")
                         continue
-
-                    temp_file = str(zip_temp_dir / info.filename)
                     self._zip_file_map[os.path.normpath(temp_file)] = (
                         composite_key,
                         zip_source_name,
@@ -2064,12 +2130,16 @@ class FileProcessor:
                         new_metadata["File:FileTypeExtension"] = filetype_ext
 
                     self.files_processed += 1
-                    self.process_file(new_metadata)
+                    file_ok = self.process_file(new_metadata)
                     if on_file_done:
                         on_file_done()
 
-                    # Checkpoint (non-DB mode): track processed path and flush periodically
-                    if getattr(self.config, 'output_mode', 'json') not in ('db', 'both'):
+                    # Checkpoint (non-DB mode): track processed path and flush
+                    # periodically. Only files whose metadata write SUCCEEDED
+                    # are recorded — checkpointing failures made resume skip
+                    # files that have no persisted output.
+                    if (file_ok
+                            and getattr(self.config, 'output_mode', 'json') not in ('db', 'both')):
                         src = new_metadata.get('SourceFile')
                         if src:
                             self._checkpoint_paths.add(_norm_path_key(src))
@@ -2093,18 +2163,29 @@ class FileProcessor:
             keywords = metadata.get("MWG:Keywords")
             caption = metadata.get("MWG:Description")
             
-            # Orphan check
-            if identifier and self.config.reprocess_orphans and keywords and not status:
-                    metadata["XMP:Status"] = "success"                    
+            # Orphan check. When reprocess_all is set, skip the orphan
+            # status write entirely and fall through so the file is
+            # reprocessed (the old combined condition reported a SUCCESSFUL
+            # write as 'Metadata write error' and returned None, so orphans
+            # were never reprocessed despite reprocess_all).
+            if (identifier and self.config.reprocess_orphans and keywords
+                    and not status and not self.config.reprocess_all):
+                    metadata["XMP:Status"] = "success"
                     status = "success"
                     try:
-                        written = self.write_metadata(file_path, metadata)
-                        
-                        if written and not self.config.reprocess_all:
-                            
-                            print(f"Status added for orphan: {file_path}")  
+                        # Persist only the status marker. The keywords in
+                        # this dict are the file's pre-existing embedded
+                        # keywords — writing them would insert unvetted
+                        # foreign keywords into the canonical tags table.
+                        orphan_meta = dict(metadata)
+                        orphan_meta["MWG:Keywords"] = []
+                        orphan_meta["_raw_keywords"] = []
+                        orphan_meta["_debug_map"] = {}
+                        written = self.write_metadata(file_path, orphan_meta)
+
+                        if written:
+                            print(f"Status added for orphan: {file_path}")
                             self.callback(f"Status added for orphan: {file_path}")
-                            
                         else:
                             print(f"Metadata write error for orphan: {file_path}")
                             self.callback(f"Metadata write error for orphan: {file_path}")
@@ -2169,6 +2250,7 @@ class FileProcessor:
                 time.sleep(0.1)
 
             if self.check_paused_or_stopped():
+                self._stop_requested = True
                 return True
 
         return False
@@ -2268,7 +2350,16 @@ class FileProcessor:
                 for key in list(meta.keys()):
                     if key in fields_to_clear:
                         del meta[key]
-                sidecar_data = self._read_json_sidecar(source_file)
+                # use_sidecar mode substitutes 'file.jpg.xmp' as the source
+                # path; the JSON sidecar is keyed to the ORIGINAL image path
+                # ('file.jpg'), so strip the .xmp suffix for the lookup or
+                # status/identifier are never found and files reprocess
+                # every run.
+                sidecar_lookup = source_file
+                if (getattr(self.config, 'use_sidecar', False)
+                        and sidecar_lookup.lower().endswith('.xmp')):
+                    sidecar_lookup = os.path.splitext(sidecar_lookup)[0]
+                sidecar_data = self._read_json_sidecar(sidecar_lookup)
                 if sidecar_data:
                     if sidecar_data.get("Description"):
                         meta["Description"] = sidecar_data["Description"]
@@ -2407,6 +2498,23 @@ class FileProcessor:
                     self.failed_validations.append(file_path)
                     if self.config.rename_invalid:
                         self.rename_to_invalid(file_path)
+                    else:
+                        # Persist the verdict — 'invalid' was honored as a
+                        # skip condition but never written anywhere, so
+                        # these files were re-validated on every run.
+                        try:
+                            invalid_meta = {
+                                "SourceFile": file_path,
+                                "XMP:Status": "invalid",
+                                "XMP:Identifier": metadata.get("XMP:Identifier")
+                                                  or str(uuid.uuid4()),
+                            }
+                            for _k in ('_zip_db_key', '_zip_source'):
+                                if _k in metadata:
+                                    invalid_meta[_k] = metadata[_k]
+                            self.write_metadata(file_path, invalid_meta)
+                        except Exception as _e:
+                            print(f"  Could not persist invalid status: {_e}")
                     self.callback(f"---")
                     return
 
@@ -2599,15 +2707,20 @@ class FileProcessor:
                 self.callback("---")   
                 
             if self.check_pause_stop():
-                return
-            
+                return success
+
+            return success
+
+        except StopProcessing:
+            # A user Stop is not a per-file error — let it unwind.
+            raise
         except Exception as e:
             print(f"Processing Error: {os.path.basename(file_path)}")
             print(f"  Error type: {type(e).__name__}")
             print(f"  Details: {str(e)}")
             self.callback(f"<b>Error processing:</b> {file_path}: {str(e)}")
             self.callback(f"---")
-            return
+            return False
     
     def generate_metadata(self, metadata, processed_image):
         """ Generate metadata without writing to file.
@@ -2733,7 +2846,9 @@ class FileProcessor:
             new_metadata["SourceFile"] = file_path
             
             return new_metadata
-            
+
+        except StopProcessing:
+            raise
         except Exception as e:
             print(f"Metadata Generation Error: {os.path.basename(file_path)}")
             print(f"  Error type: {type(e).__name__}")
@@ -2844,6 +2959,10 @@ class FileProcessor:
                                 "\nDB connection could not be restored after 3 attempts. "
                                 "Falling back to JSON-only output for the remainder of this run."
                             )
+                        # Either way this file's DB write did not happen —
+                        # without this the file was logged as 'written
+                        # successfully' even though nothing was persisted.
+                        success = False
                         self.callback(msg)
                         print(msg)
 
@@ -3473,23 +3592,36 @@ def main(config=None, callback=None, check_paused_or_stopped=None):
     
     try:
         file_processor.process_directory(config.directory)
-    
+
     except KeyboardInterrupt:
         print("Processing interrupted. State saved for resuming later.")
-        
+
         if callback:
             callback("Processing interrupted. State saved for resuming later.")
-    
+
+    except StopProcessing:
+        print("Processing stopped by user.")
+
+        if callback:
+            callback("Processing stopped by user.")
+
     except Exception as e:
         print(f"Error occurred during processing: {str(e)}")
-    
+
         if callback:
             callback(f"Error: {str(e)}")
             
     finally:
-        print("Waiting for indexer to complete...")
-        file_processor.indexer.join()
-        print("Indexing completed.")
+        # Signal the crawler to stop and wait briefly. The old untimed
+        # join() blocked Stop until the entire directory tree finished
+        # crawling (minutes on network shares); the indexer is a daemon
+        # thread now, so a stuck crawl cannot prevent process exit either.
+        file_processor.indexer.stop()
+        file_processor.indexer.join(timeout=10)
+        if file_processor.indexer.is_alive():
+            print("Indexer still finishing in the background (daemon).")
+        else:
+            print("Indexing stopped.")
         
    
 if __name__ == "__main__":
