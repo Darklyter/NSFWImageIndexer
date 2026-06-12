@@ -237,7 +237,13 @@ class JsonParser:
 
     def repair_json(self):
         self.reset_pointer()
-        self.eat_object()
+        try:
+            self.eat_object()
+        except IndexError:
+            # Truncated input (e.g. a VLM response cut off at the token
+            # limit) ran past end-of-string. Surface the documented
+            # exception type instead of a bare IndexError.
+            raise JsonFixError('Unexpected end of input') from None
         return self.quoted
 
     def de_stringify(self, string):
@@ -352,7 +358,8 @@ class JsonParser:
 
     def eat_reference_number(self):
         number_regex = re.compile(r'[0-9]')
-        while number_regex.match(self.inspected[self.position]):
+        while (self.position < len(self.inspected)
+               and number_regex.match(self.inspected[self.position])):
             self.position += 1
 
     def eat_close_angle_bracket(self):
@@ -368,7 +375,8 @@ class JsonParser:
 
     def eat_whitespace(self):
         whitespace_regex = re.compile(r'\s')
-        while whitespace_regex.match(self.inspected[self.position]):
+        while (self.position < len(self.inspected)
+               and whitespace_regex.match(self.inspected[self.position])):
             self.position += 1
 
     def eat_open_brace(self):
@@ -678,9 +686,12 @@ class JsonParser:
             self.eat_circular()
 
     def eat_circular(self):
-        test_regex = re.compile(r'[Circular *\d]')
-        while test_regex.match(self.inspected[self.position]):
-            self.position += 1
+        # Match the literal 'Circular *N' token. The old pattern was a
+        # character CLASS ([Circular *\d]) that ate any run of those
+        # letters/digits one char at a time.
+        m = re.compile(r'Circular\s*\*?\s*\d*').match(self.inspected, self.position)
+        if m:
+            self.position = m.end()
         self.quoted += '"Circular"'
 
     def eat_comma(self):
@@ -804,7 +815,7 @@ singular_rules = [
     ["(?i)(vert|ind)ices$", "\\1ex"],
     ["(?i)^(ox)en", "\\1"],
     ["(?i)(alias|status)es$", "\\1"],
-    ["(?i)([octop|vir])i$", "\\1us"],
+    ["(?i)(octop|vir)i$", "\\1us"],
     ["(?i)(cris|ax|test)es$", "\\1is"],
     ["(?i)(shoe)s$", "\\1"],
     ["(?i)(o)es$", "\\1"],
@@ -950,7 +961,7 @@ singular_ie = [
     "meanie",
     "nightie",
     "oldie",
-    "^pie",
+    "pie",
     "pixie",
     "quickie",
     "reverie",
@@ -960,7 +971,7 @@ singular_ie = [
     "stoolie",
     "sweetie",
     "techie",
-    "^tie",
+    "tie",
     "toughie",
     "valkyrie",
     "veggie",
@@ -1057,7 +1068,7 @@ plural_prepositions = [
     "with",
 ]
 
-def de_pluralize(word, custom={}):
+def de_pluralize(word, custom=None):
     """ Convert a plural word to its singular form while preserving words 
         ending in double 's'.
         
@@ -1069,6 +1080,9 @@ def de_pluralize(word, custom={}):
             str: The singular form of the word, or the original word if it
                 ends in double 's' or cannot be converted
     """
+    if custom is None:
+        custom = {}
+
     if not isinstance(word, str):
         print(f"Warning: singular function received non-string input: {type(word)}")
         return str(word)
@@ -1105,7 +1119,10 @@ def de_pluralize(word, custom={}):
     # Apply rules
     for rule, replacement in singular_rules:
         if re.search(rule, word, re.IGNORECASE):
-            return re.sub(rule, replacement, word)
+            result = re.sub(rule, replacement, word)
+            # Never reduce a word to nothing (the catch-all 's$' rule
+            # would turn a bare 's' into an empty string).
+            return result if result.strip() else word
 
     # If no rules apply, return the original word
     return word
