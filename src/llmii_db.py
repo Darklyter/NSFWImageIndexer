@@ -188,7 +188,8 @@ def _upsert_performer(cur, name):
     return row[0]
 
 
-def _upsert_image(cur, file_path, identifier, gallery_id=None, zip_source=None):
+def _upsert_image(cur, file_path, identifier, gallery_id=None, zip_source=None,
+                  sha256=None):
     """Insert or update image row, return its id.
 
     For images extracted from zip archives, file_path may be a composite key
@@ -203,18 +204,34 @@ def _upsert_image(cur, file_path, identifier, gallery_id=None, zip_source=None):
     else:
         filename = Path(path_str).name
 
+    # File copies can carry the same embedded XMP:Identifier, but
+    # images.identifier is UNIQUE — reusing it for a second path would
+    # raise IntegrityError and abort this image's whole write. Track the
+    # copy as its own row under a fresh UUID instead (content-level
+    # duplicate detection is what the sha256 column is for).
+    cur.execute(
+        "SELECT 1 FROM images WHERE identifier = %s AND path <> %s",
+        (identifier, path_str),
+    )
+    if cur.fetchone():
+        new_id = str(_uuid_mod.uuid4())
+        print(f"Identifier {identifier} already belongs to another path; "
+              f"assigning {new_id} to {filename}")
+        identifier = new_id
+
     cur.execute(
         """
-        INSERT INTO images (identifier, filename, path, gallery_id, zip_source)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO images (identifier, filename, path, gallery_id, zip_source, sha256)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (path) DO UPDATE SET
             identifier = EXCLUDED.identifier,
             gallery_id = EXCLUDED.gallery_id,
             zip_source = EXCLUDED.zip_source,
+            sha256     = COALESCE(EXCLUDED.sha256, images.sha256),
             updated_at = now()
         RETURNING id
         """,
-        (identifier, filename, path_str, gallery_id, zip_source),
+        (identifier, filename, path_str, gallery_id, zip_source, sha256),
     )
     return cur.fetchone()[0]
 
@@ -312,6 +329,11 @@ def apply_migrations(conn):
         "ALTER TABLE performer_tags ADD COLUMN IF NOT EXISTS manually_added BOOLEAN NOT NULL DEFAULT FALSE",
         # tags: global flag to exclude a tag from all performer_tags
         "ALTER TABLE tags ADD COLUMN IF NOT EXISTS exclude_from_performers BOOLEAN NOT NULL DEFAULT FALSE",
+        # sha256 duplicate detection: the original UNIQUE constraint forbade
+        # exactly the data find_duplicate_images() looks for (two rows with
+        # the same hash). Drop it and index the column for the GROUP BY.
+        "ALTER TABLE images DROP CONSTRAINT IF EXISTS images_sha256_key",
+        "CREATE INDEX IF NOT EXISTS images_sha256_idx ON images (sha256) WHERE sha256 IS NOT NULL",
     ]
     # Each migration runs under its own SAVEPOINT so one failing statement
     # (e.g. on a partially-built or divergent schema) neither aborts the
@@ -427,7 +449,7 @@ def get_image_status_batch(conn, file_paths):
                     WHERE irs.image_id = i.id
                     ORDER BY irs.processed_at DESC
                     LIMIT 1) AS status,
-                   (SELECT COUNT(*)
+                   (SELECT COUNT(DISTINCT ik.tag_id)
                     FROM image_keywords ik
                     WHERE ik.image_id = i.id) AS keyword_count
             FROM images i
@@ -503,7 +525,8 @@ def link_studio_image(conn, studio_name, image_path):
 # Main write function
 # ---------------------------------------------------------------------------
 
-def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None):
+def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None,
+                      sha256=None, keep_history=False):
     """Write all image processing results for one image to the database.
 
     Parameters
@@ -521,6 +544,13 @@ def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None):
     run_id     : tagger_runs.id for the current processing run
     zip_source : base filename of the originating zip archive (e.g. 'sets.zip'),
                  or None for regular image files.
+    sha256     : optional content hash of the image file (enables duplicate
+                 detection via find_duplicate_images).
+    keep_history : mirror of the "Don't clear existing keywords" setting.
+                 False (default) — reprocessing REPLACES the image's matched/
+                 unmatched keywords across ALL runs, so tags the model no
+                 longer produces actually disappear. True — prior runs'
+                 keyword rows are kept and only this run's rows are replaced.
     """
     # images.identifier is uuid NOT NULL — generate a UUID if none was assigned yet
     # (process_file always assigns one, but guard here so the INSERT never fails)
@@ -591,7 +621,8 @@ def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None):
             gallery_id = _upsert_gallery(cur, gallery_name) if gallery_name else None
 
             # Image (pass composite key as path; zip_source stored for provenance)
-            image_id = _upsert_image(cur, file_path, identifier, gallery_id, zip_source)
+            image_id = _upsert_image(cur, file_path, identifier, gallery_id, zip_source,
+                                     sha256=sha256)
 
             # Studio (auto-detected from path)
             if _detected_studio:
@@ -652,17 +683,33 @@ def write_image_to_db(conn, file_path, metadata, run_id, zip_source=None):
                     (image_id, description, run_id),
                 )
 
-            # Replace keyword sets for this image+run (handles reprocessing)
-            cur.execute(
-                "DELETE FROM image_keywords WHERE image_id = %s AND tagger_run_id = %s",
-                (image_id, run_id),
-            )
+            # Replace keyword sets. Reprocessing virtually always happens in
+            # a NEW tagger run, so a delete scoped to the current run_id
+            # matches zero rows and stale tags from earlier runs would
+            # persist forever. Unless the user asked to keep existing
+            # keywords (keep_history), clear them image-wide so the new
+            # generation fully replaces the old one. Raw LLM output is
+            # always kept per-run as provenance.
+            if keep_history:
+                cur.execute(
+                    "DELETE FROM image_keywords WHERE image_id = %s AND tagger_run_id = %s",
+                    (image_id, run_id),
+                )
+                cur.execute(
+                    "DELETE FROM image_keywords_unmatched WHERE image_id = %s AND tagger_run_id = %s",
+                    (image_id, run_id),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM image_keywords WHERE image_id = %s",
+                    (image_id,),
+                )
+                cur.execute(
+                    "DELETE FROM image_keywords_unmatched WHERE image_id = %s",
+                    (image_id,),
+                )
             cur.execute(
                 "DELETE FROM image_keywords_raw WHERE image_id = %s AND tagger_run_id = %s",
-                (image_id, run_id),
-            )
-            cur.execute(
-                "DELETE FROM image_keywords_unmatched WHERE image_id = %s AND tagger_run_id = %s",
                 (image_id, run_id),
             )
 

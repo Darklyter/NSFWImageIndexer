@@ -150,11 +150,17 @@ _DDL = [
             zip_source      text,
             CONSTRAINT images_identifier_key UNIQUE (identifier),
             CONSTRAINT images_path_key       UNIQUE (path),
-            CONSTRAINT images_sha256_key     UNIQUE (sha256),
             CONSTRAINT images_gallery_id_fkey
                 FOREIGN KEY (gallery_id) REFERENCES ai_captioning.galleries(id)
                 ON DELETE SET NULL
         )
+        """,
+    ),
+    (
+        "Index: images_sha256_idx",
+        """
+        CREATE INDEX IF NOT EXISTS images_sha256_idx
+            ON ai_captioning.images (sha256) WHERE sha256 IS NOT NULL
         """,
     ),
     (

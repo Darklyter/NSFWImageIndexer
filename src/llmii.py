@@ -1,4 +1,4 @@
-import os, json, time, re, argparse, exiftool, threading, queue, calendar, io, uuid, requests, shutil, zipfile
+import os, json, time, re, argparse, exiftool, threading, queue, calendar, io, uuid, requests, shutil, zipfile, hashlib
 from pathlib import Path
 from json_repair import repair_json as rj
 from datetime import timedelta, datetime
@@ -574,6 +574,22 @@ class TagMatcher:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         except Exception:
             pass
+
+
+def _sha256_file(path):
+    """Content hash of a file, or None if it cannot be read.
+
+    Feeds images.sha256 so find_duplicate_images() can detect exact
+    duplicates. Streamed in 1 MiB chunks to keep memory flat on large files.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
 
 
 def _checkpoint_path():
@@ -2374,7 +2390,15 @@ class FileProcessor:
                 # failed files as successful completions.
                 success = False
                 if not self.config.dry_run:
-                    self.write_metadata(file_path, metadata)
+                    # Record only the failure status. metadata still carries
+                    # the file's PRE-EXISTING embedded keywords; writing them
+                    # would insert arbitrary foreign keywords into the
+                    # canonical tags table as if they were generated output.
+                    failed_meta = dict(metadata)
+                    failed_meta["MWG:Keywords"] = []
+                    failed_meta["_raw_keywords"] = []
+                    failed_meta["_debug_map"] = {}
+                    self.write_metadata(file_path, failed_meta)
                 
                 
             # Fix file extension if enabled (before writing metadata)
@@ -2654,10 +2678,16 @@ class FileProcessor:
 
         # Database write (uses composite key for zip images)
         if output_mode in ('db', 'both') and self.db_conn and self.db_run_id:
+            # Content hash for duplicate detection. file_path is the real
+            # file on disk (the temp file for zip images, which still
+            # exists at write time).
+            sha256 = _sha256_file(file_path) if os.path.exists(file_path) else None
+            keep_history = bool(getattr(self.config, 'update_keywords', False))
             try:
                 llmii_db.write_image_to_db(
                     self.db_conn, db_path, metadata, self.db_run_id,
-                    zip_source=zip_source,
+                    zip_source=zip_source, sha256=sha256,
+                    keep_history=keep_history,
                 )
             except Exception as e:
                 err_name = type(e).__name__
@@ -2685,7 +2715,8 @@ class FileProcessor:
                         try:
                             llmii_db.write_image_to_db(
                                 self.db_conn, db_path, metadata, self.db_run_id,
-                                zip_source=zip_source,
+                                zip_source=zip_source, sha256=sha256,
+                                keep_history=keep_history,
                             )
                             self.callback(" Reconnected — write succeeded.")
                         except Exception as retry_e:
