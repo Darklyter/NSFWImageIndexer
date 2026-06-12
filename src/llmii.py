@@ -1430,7 +1430,12 @@ class FileProcessor:
             sidecar_name = f"{safe_dir}---{base_name}.json"
             return os.path.join(self.config.sidecar_dir, sidecar_name)
         else:
-            return os.path.splitext(file_path)[0] + ".json"
+            # Extension-preserving (photo.jpg -> photo.jpg.json) so same-stem
+            # images like photo.jpg + photo.png don't share one sidecar
+            # (the second file used to inherit the first one's status and be
+            # silently skipped). Legacy stem-named sidecars (photo.json) are
+            # still found via the read fallback in _read_json_sidecar.
+            return file_path + ".json"
 
     def _zip_sidecar_path(self, composite_key):
         """Return a PERSISTENT sidecar path for an image inside a zip archive.
@@ -1460,6 +1465,12 @@ class FileProcessor:
         """
         if sidecar_path is None:
             sidecar_path = self._get_sidecar_path(file_path)
+            if not os.path.exists(sidecar_path) and not self.config.sidecar_dir:
+                # Fall back to the legacy stem-named sidecar written by
+                # earlier versions (photo.json for photo.jpg).
+                legacy = os.path.splitext(file_path)[0] + ".json"
+                if os.path.exists(legacy):
+                    sidecar_path = legacy
         if not os.path.exists(sidecar_path):
             return None
         try:
