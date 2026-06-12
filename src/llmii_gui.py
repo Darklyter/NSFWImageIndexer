@@ -2645,6 +2645,19 @@ class ImageIndexerGUI(QMainWindow):
         self._rescale_image()
         
     def closeEvent(self, event):
+        # Stop a running indexer before the window (and its QThread object)
+        # is destroyed — otherwise Qt aborts the process with
+        # "QThread: Destroyed while thread is still running".
+        if self.indexer_thread is not None and self.indexer_thread.isRunning():
+            self.indexer_thread.stopped = True
+            self.pause_handler.stop_signal.emit()
+            # The worker runs a blocking llmii.main() with no event loop, so
+            # quit() is a no-op; only the stopped flag (polled at the next
+            # checkpoint) ends it. Wait bounded, then terminate rather than
+            # hanging the close on an in-flight API/ExifTool call.
+            if not self.indexer_thread.wait(10000):
+                self.indexer_thread.terminate()
+                self.indexer_thread.wait()
         # Clean up API check thread when closing the window
         if self.api_check_thread and self.api_check_thread.isRunning():
             self.api_check_thread.stop()
