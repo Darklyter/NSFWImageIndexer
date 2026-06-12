@@ -64,7 +64,7 @@ _DIRECT_KEYS = [
 ]
 
 
-def build_config(side, sample_dir):
+def build_config(side, sample_dir, backend='kobold'):
     with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
         settings = json.load(f)
 
@@ -101,8 +101,10 @@ def build_config(side, sample_dir):
     config.sidecar_dir = ''
     config.normalize_keywords = True
 
-    # Backend toggle is the ONLY difference between the two sides
-    config.lm_studio = (side == 'b')
+    # The side label only names the result file; the backend is explicit.
+    # Default is KoboldCpp for BOTH sides (swap the loaded model between
+    # runs) — same backend + samplers makes a fairer model-vs-model test.
+    config.lm_studio = (backend == 'lmstudio')
     return config
 
 
@@ -110,11 +112,11 @@ def build_config(side, sample_dir):
 # Run one side
 # ---------------------------------------------------------------------------
 
-def run_side(side, sample_dir, limit):
+def run_side(side, sample_dir, limit, backend='kobold'):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_path = os.path.join(RESULTS_DIR, f'side_{side}.jsonl')
 
-    config = build_config(side, sample_dir)
+    config = build_config(side, sample_dir, backend)
     backend = ('LM Studio @ ' + config.lm_studio_url + ' / ' + config.lm_studio_model
                ) if config.lm_studio else ('KoboldCpp @ ' + config.api_url)
     print(f"Side {side.upper()}: {backend}")
@@ -293,9 +295,11 @@ def main():
     sub = p.add_subparsers(dest='cmd', required=True)
     runp = sub.add_parser('run', help='run one side')
     runp.add_argument('side', choices=['a', 'b'],
-                      help="a = KoboldCpp (current model), b = LM Studio (candidate)")
+                      help="result-file label: a = current model, b = candidate")
     runp.add_argument('--dir', required=True, help='sample image directory')
     runp.add_argument('--limit', type=int, default=100)
+    runp.add_argument('--backend', choices=['kobold', 'lmstudio'], default='kobold',
+                      help='which server to call (default: kobold for both sides)')
     sub.add_parser('report', help='print the comparison report')
 
     args = p.parse_args()
@@ -303,7 +307,7 @@ def main():
         if not os.path.isdir(args.dir):
             print(f"Not a directory: {args.dir}")
             sys.exit(1)
-        run_side(args.side, os.path.normpath(args.dir), args.limit)
+        run_side(args.side, os.path.normpath(args.dir), args.limit, args.backend)
     else:
         report()
 
