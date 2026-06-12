@@ -3,8 +3,8 @@ export const meta = {
   description: 'Classify unmatched LLM keywords against the canonical tag vocabulary — map to existing tags, propose new tags, or blacklist objects/props — and write a reviewable proposal file',
   whenToUse: 'After processing images, to triage image_keywords_unmatched: turn high-frequency unmatched keywords into aliases on existing tags, new canonical tags, or a keyword blacklist. Re-run any time the unmatched table grows.',
   phases: [
-    { title: 'Load', detail: 'refresh canonical + unmatched data from the DB' },
-    { title: 'Classify', detail: 'one agent per batch of unmatched keywords' },
+    { title: 'Load', detail: 'refresh canonical + unmatched data, count terms' },
+    { title: 'Classify', detail: 'one agent per line-range batch of unmatched keywords' },
     { title: 'Verify', detail: 'adversarially re-check each MAP decision against the vocabulary' },
     { title: 'Consolidate', detail: 'unify new-tag proposals across batches' },
   ],
@@ -15,11 +15,12 @@ const CANON = `${ROOT}\\tag_canonical.txt`
 const UNMATCHED = `${ROOT}\\tag_unmatched.txt`
 const OUT = `${ROOT}\\tag_proposals_full.json`
 
-// args: { threshold?: number (min image count, default 10), batchSize?: number (default 70) }
+// args: { threshold?: number (default 10), batchSize?: number (default 70),
+//         count?: number (skip the refresh/Load agent if the data files are
+//         already fresh and you pass the line count of tag_unmatched.txt) }
 const threshold = (args && args.threshold) || 10
 const batchSize = (args && args.batchSize) || 70
 
-// The user's tagging taste — what belongs in the vocabulary vs. what's noise.
 const INTENT = `This is an adult-image tagging pipeline with a curated, StashDB-style
 vocabulary. The user TAGS: anatomy (breasts, areolas, nipples, vulva/pussy/labia,
 ass/butt, body parts), body type/build, skin tone, ethnicity, hair (color/length/
@@ -42,13 +43,14 @@ const CLASSIFY_SCHEMA = {
         type: 'object',
         properties: {
           keyword: { type: 'string' },
+          images: { type: 'number', description: 'the integer before the tab on that line' },
           decision: { type: 'string', enum: ['map', 'new', 'blacklist', 'skip'] },
-          tag: { type: 'string', description: 'for decision=map: the EXACT canonical tag string it maps to' },
-          new_tag: { type: 'string', description: 'for decision=new: proposed new canonical tag name' },
+          tag: { type: 'string', description: 'for map: the EXACT canonical tag string' },
+          new_tag: { type: 'string', description: 'for new: proposed new canonical tag name' },
           confidence: { type: 'string', enum: ['high', 'med', 'low'] },
           note: { type: 'string' },
         },
-        required: ['keyword', 'decision', 'confidence', 'note'],
+        required: ['keyword', 'images', 'decision', 'confidence', 'note'],
       },
     },
   },
@@ -65,8 +67,8 @@ const VERIFY_SCHEMA = {
         properties: {
           keyword: { type: 'string' },
           tag: { type: 'string' },
-          correct: { type: 'boolean', description: 'true if the keyword genuinely means the same as the tag and the tag exists verbatim in the vocabulary' },
-          corrected_tag: { type: 'string', description: 'if not correct but a better existing tag exists, the better tag; else empty' },
+          correct: { type: 'boolean' },
+          corrected_tag: { type: 'string' },
           reason: { type: 'string' },
         },
         required: ['keyword', 'tag', 'correct', 'reason'],
@@ -84,8 +86,8 @@ const CONSOLIDATE_SCHEMA = {
       items: {
         type: 'object',
         properties: {
-          tag: { type: 'string', description: 'unified canonical name for the new tag' },
-          aliases: { type: 'array', items: { type: 'string' }, description: 'unmatched keywords that should map under it' },
+          tag: { type: 'string' },
+          aliases: { type: 'array', items: { type: 'string' } },
           rationale: { type: 'string' },
         },
         required: ['tag', 'aliases', 'rationale'],
@@ -97,10 +99,13 @@ const CONSOLIDATE_SCHEMA = {
 
 phase('Load')
 
-const loaded = await agent(
-  `Refresh the tag-reconciliation data from the PostgreSQL database, then return the unmatched terms.
-
-Run this exactly (it reads DB creds from settings.json and writes two files):
+// Refresh the data files and get the line count. Returning ONLY a count keeps
+// this robust (no bulk structured-output). Skipped if args.count is provided
+// and the files are already fresh.
+let count = (args && args.count) || 0
+if (!count) {
+  const loaded = await agent(
+    `Refresh the tag-reconciliation data, then report the line count. Run exactly:
 
 cd ${ROOT} && ./.venv/Scripts/python -c "
 import json, psycopg2
@@ -112,88 +117,63 @@ open('tag_canonical.txt','w',encoding='utf-8').write('\\n'.join(r[0] for r in cu
 cur.execute('SELECT keyword, COUNT(*) c FROM image_keywords_unmatched GROUP BY keyword HAVING COUNT(*) >= ${threshold} ORDER BY c DESC')
 rows = cur.fetchall()
 open('tag_unmatched.txt','w',encoding='utf-8').write('\\n'.join(f'{c}\\t{k}' for k,c in rows))
-print('TERMS', len(rows))
+print('LINES', len(rows))
 conn.close()
 "
 
-Then read ${UNMATCHED} and return EVERY line as a result item {keyword, images} (images = the integer before the tab). Return all of them, do not truncate.`,
-  {
-    label: 'load:refresh-data',
-    phase: 'Load',
-    schema: {
-      type: 'object',
-      properties: {
-        terms: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: { keyword: { type: 'string' }, images: { type: 'number' } },
-            required: ['keyword', 'images'],
-          },
-        },
-      },
-      required: ['terms'],
-    },
-  },
-)
+Return the integer printed after LINES.`,
+    { label: 'load:refresh-data', phase: 'Load',
+      schema: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] } },
+  )
+  count = (loaded && loaded.count) || 0
+}
 
-const terms = (loaded && loaded.terms) || []
-log(`Loaded ${terms.length} unmatched terms (>= ${threshold} images). Batching by ${batchSize}.`)
+log(`${count} unmatched terms (>= ${threshold} images). Classifying in batches of ${batchSize}.`)
 
 phase('Classify')
 
-const batches = []
-for (let i = 0; i < terms.length; i += batchSize) batches.push(terms.slice(i, i + batchSize))
+// Line ranges (1-based inclusive) over tag_unmatched.txt.
+const ranges = []
+for (let s = 1; s <= count; s += batchSize) ranges.push([s, Math.min(s + batchSize - 1, count)])
 
-// Classify each batch, then adversarially verify its MAP decisions.
 const classified = await pipeline(
-  batches,
-  (batch, _orig, idx) => agent(
+  ranges,
+  (range, _orig, idx) => agent(
     `${INTENT}
 
-You are classifying a batch of UNMATCHED keywords (model output that did not match any canonical tag).
-First, read the full canonical vocabulary file with the Read tool: ${CANON}
-(one tag per line — these are the ONLY valid targets for decision=map; the tag string must appear verbatim).
+Read the canonical vocabulary first (one tag per line; the ONLY valid map targets, must match verbatim):
+  Read ${CANON}
+Then read lines ${range[0]}-${range[1]} of this file (each line is: <image-count> TAB <keyword>):
+  Read ${UNMATCHED}
 
-For EACH keyword below, choose a decision:
-- "map": it means the same as an existing canonical tag → set tag to that EXACT vocabulary string. Note: the engine already fuzzy-matches at 85, so only SEMANTIC equivalents remain (e.g. "moderate areola" → "Medium Areolas", "buttocks" → "Ass"). Confidence high only when the meaning is unambiguous.
-- "new": a concept the user clearly tags (per the intent above) but no existing tag fits → propose new_tag (Title Case, matching the vocabulary's style). Group obvious synonyms under one new_tag name.
-- "blacklist": an object/furniture/setting/background/prop/food/decor/image-quality/watermark term the user does NOT want (per the intent). Watermarks/logos map to "Watermark" if that tag exists, else blacklist.
-- "skip": too vague, generic, or low-value to act on ("intimate pose", "nice view").
+For EACH keyword on those lines choose a decision:
+- "map": same meaning as an existing canonical tag → tag = that EXACT vocabulary string. The engine already fuzzy-matches at 85, so only SEMANTIC equivalents remain (e.g. "moderate areola"→"Medium Areolas", "buttocks"→"Ass"). confidence high only when unambiguous.
+- "new": a concept the user tags (per intent) with no existing tag → propose new_tag (Title Case, vocabulary style); group synonyms under one name.
+- "blacklist": object/furniture/setting/background/prop/food/decor/image-quality/watermark term the user does NOT want (watermarks→"Watermark" if it exists, else blacklist).
+- "skip": too vague/generic/low-value.
 
-Keywords (one per line):
-${batch.map(t => t.keyword).join('\n')}
-
-Return a result for every keyword.`,
+Return a result per keyword, including its images integer from the line.`,
     { label: `classify:${idx}`, phase: 'Classify', schema: CLASSIFY_SCHEMA },
   ),
-  (cls, batch, idx) => {
+  (cls, _range, idx) => {
     const maps = ((cls && cls.results) || []).filter(r => r.decision === 'map' && r.tag)
     if (!maps.length) return { cls, verdicts: [] }
     return agent(
-      `Adversarially verify these proposed keyword→tag mappings for an adult-image tag vocabulary.
-Read the canonical vocabulary: ${CANON}
-For each mapping decide correct=true ONLY if (a) the tag string appears verbatim in that file AND (b) the keyword genuinely means the same concept (not merely related). Anatomy size/shade words must match (moderate≈medium, prominent≈big is acceptable; "small" mapped to "Big Areolas" is NOT). If wrong but a better existing tag exists, give corrected_tag.
+      `Adversarially verify these keyword→tag mappings for an adult-image vocabulary.
+Read ${CANON}. correct=true ONLY if the tag appears verbatim in that file AND the keyword genuinely means the same concept (anatomy size/shade must match: moderate≈medium ok; small→"Big Areolas" NOT ok). If wrong but a better existing tag exists, give corrected_tag.
 
-Mappings:
 ${maps.map(m => `${m.keyword}  ->  ${m.tag}`).join('\n')}`,
       { label: `verify:${idx}`, phase: 'Verify', schema: VERIFY_SCHEMA },
     ).then(v => ({ cls, verdicts: (v && v.verdicts) || [] })).catch(() => ({ cls, verdicts: [] }))
   },
 )
 
-// ---- aggregate in JS ----
-const aliases = []         // {keyword, tag, confidence, images, note}
-const blacklist = []       // {keyword, images, note}
-const skipped = []         // {keyword, images}
-const rawNewTags = []      // {keyword, new_tag, images}
-const imagesOf = Object.fromEntries(terms.map(t => [t.keyword, t.images]))
-
+// ---- aggregate ----
+const aliases = [], blacklist = [], skipped = [], rawNewTags = []
 for (const item of classified.filter(Boolean)) {
-  const cls = item.cls || {}
   const vmap = Object.fromEntries((item.verdicts || []).map(v => [v.keyword, v]))
-  for (const r of (cls.results || [])) {
-    const imgs = imagesOf[r.keyword] || 0
+  for (const r of ((item.cls && item.cls.results) || [])) {
+    const imgs = r.images || 0
     if (r.decision === 'map' && r.tag) {
       const v = vmap[r.keyword]
       let tag = r.tag, conf = r.confidence
@@ -216,20 +196,18 @@ phase('Consolidate')
 
 let newTags = []
 if (rawNewTags.length) {
+  const imagesOf = Object.fromEntries(rawNewTags.map(n => [n.keyword, n.images]))
   const consolidated = await agent(
-    `These are proposed NEW canonical tags from many batches. Unify synonyms/duplicates into a single
-canonical Title-Case name each (e.g. "Raised Legs" and "Legs Raised" → one tag) and list the member
-keywords under each. Keep the user's vocabulary style (StashDB-like). Drop any that are really objects/
-settings (those should have been blacklisted).
+    `These are proposed NEW canonical tags from many batches. Unify synonyms/duplicates into one
+Title-Case canonical name each (e.g. "Raised Legs"+"Legs Raised" → one) and list member keywords.
+Keep the StashDB-like style. Drop any that are really objects/settings.
 
-Proposed (keyword -> proposed new_tag):
 ${rawNewTags.map(n => `${n.keyword} -> ${n.new_tag}`).join('\n')}`,
     { label: 'consolidate:new-tags', phase: 'Consolidate', schema: CONSOLIDATE_SCHEMA },
   ).catch(() => null)
   if (consolidated && consolidated.new_tags) {
     newTags = consolidated.new_tags.map(nt => ({
-      ...nt,
-      images: (nt.aliases || []).reduce((s, a) => s + (imagesOf[a] || 0), 0),
+      ...nt, images: (nt.aliases || []).reduce((s, a) => s + (imagesOf[a] || 0), 0),
     }))
   }
 }
@@ -241,25 +219,22 @@ newTags.sort((a, b) => b.images - a.images)
 const proposal = {
   generated_threshold: threshold,
   totals: {
-    terms: terms.length,
-    aliases: aliases.length,
+    terms: count, aliases: aliases.length,
     alias_image_rows: aliases.reduce((s, a) => s + a.images, 0),
-    new_tags: newTags.length,
-    blacklist: blacklist.length,
+    new_tags: newTags.length, blacklist: blacklist.length,
     blacklist_image_rows: blacklist.reduce((s, a) => s + a.images, 0),
     skipped: skipped.length,
   },
   aliases, new_tags: newTags, blacklist, skipped,
 }
 
-// Persist the full proposal for review/apply.
 await agent(
-  `Write this exact JSON to ${OUT} (overwrite). Return only "written".\n\n${JSON.stringify(proposal)}`,
+  `Write this exact JSON to ${OUT} (overwrite). Reply only "written".\n\n${JSON.stringify(proposal)}`,
   { label: 'write:proposal', phase: 'Consolidate' },
 )
 
 log(`Done: ${aliases.length} aliases (${proposal.totals.alias_image_rows.toLocaleString()} rows), ` +
     `${newTags.length} new tags, ${blacklist.length} blacklist (${proposal.totals.blacklist_image_rows.toLocaleString()} rows), ` +
-    `${skipped.length} skipped. Proposal -> tag_proposals_full.json`)
+    `${skipped.length} skipped. -> tag_proposals_full.json`)
 
 return proposal.totals
