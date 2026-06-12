@@ -844,6 +844,18 @@ class SettingsDialog(QDialog):
         An error QMessageBox is shown automatically on failure.
         """
         from . import llmii_db
+
+        # Only one DB operation at a time: _active_db_worker is the worker's
+        # sole reference, so starting a second op while one runs dropped the
+        # live QThread and aborted the process.
+        worker = getattr(self, '_active_db_worker', None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.information(
+                self, op_name,
+                "Another database operation is still running — "
+                "wait for it to finish first.")
+            return
+
         conn = self._get_db_connection()
         if not conn:
             return
@@ -1653,8 +1665,13 @@ class APICheckThread(QThread):
         while self.running:
             try:
                 for path in ("/api/extra/version", "/v1/models", "/health"):
+                    if not self.running:
+                        return  # stop() short-circuits remaining probes
                     try:
-                        response = requests.get(f"{self.api_url}{path}", timeout=5)
+                        # Short timeout: start_api_check waits on this
+                        # thread from the GUI thread, so a hanging probe
+                        # froze the UI for up to 3 x 5s.
+                        response = requests.get(f"{self.api_url}{path}", timeout=2)
                         if response.status_code == 200:
                             self.api_status.emit(True)
                             return
@@ -2223,7 +2240,7 @@ class ImageIndexerGUI(QMainWindow):
             self.settings_dialog.save_settings()
 
             self.start_api_check(self.settings_dialog.get_effective_api_url())
-            
+
             try:
                 with open('settings.json', 'r', encoding='utf-8') as f:
                     settings = json.load(f)
@@ -2232,6 +2249,12 @@ class ImageIndexerGUI(QMainWindow):
                     json.dump(settings, f, indent=4, ensure_ascii=False)
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to save directory setting: {e}")
+        else:
+            # Cancelled: the dialog object is reused and run_indexer reads
+            # config straight from its live widgets, so edited-but-cancelled
+            # values would silently drive the next run. Re-load the widgets
+            # from the last saved settings.json.
+            self.settings_dialog.load_settings()
 
     def select_directory(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Directory")
@@ -2242,7 +2265,9 @@ class ImageIndexerGUI(QMainWindow):
         self.api_url = api_url
         if self.api_check_thread and self.api_check_thread.isRunning():
             self.api_check_thread.stop()
-            self.api_check_thread.wait()
+            # Bounded: an in-flight probe holds the thread for up to its
+            # request timeout; don't freeze the GUI waiting for it.
+            self.api_check_thread.wait(3000)
             
         self.api_is_ready = False
         self.run_button.setEnabled(False)
@@ -2284,7 +2309,15 @@ class ImageIndexerGUI(QMainWindow):
             trim = len(self.image_history) - _MAX_HISTORY
             del self.image_history[:trim]
             if self.current_position != -1:
-                self.current_position = max(0, self.current_position - trim)
+                new_pos = self.current_position - trim
+                if new_pos < 0:
+                    # The entry being viewed was trimmed away — show the
+                    # oldest surviving entry instead of leaving a stale
+                    # image on screen pointing at a different index.
+                    self.current_position = 0
+                    self.display_image(*self.image_history[0])
+                else:
+                    self.current_position = new_pos
 
         # If user was viewing the most recent image (or this is the first image),
         # update current_position to point to the new image
@@ -2459,7 +2492,24 @@ class ImageIndexerGUI(QMainWindow):
         
         # Get directory from main window
         config.directory = self.dir_input.text()
-        
+
+        # Persist the directory now — it was only saved when the Settings
+        # dialog was accepted, so running on a new directory and restarting
+        # the app silently reverted to the old one.
+        try:
+            if os.path.exists('settings.json'):
+                with open('settings.json', 'r', encoding='utf-8') as f:
+                    _settings = json.load(f)
+            else:
+                _settings = {}
+            if _settings.get('directory') != config.directory:
+                _settings['directory'] = config.directory
+                with open('settings.json', 'w', encoding='utf-8') as f:
+                    json.dump(_settings, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Warning: could not persist directory setting: {e}")
+
+
         # Load settings from settings dialog
         config.api_url = self.settings_dialog.api_url_input.text()
         config.api_password = self.settings_dialog.api_password_input.text()
