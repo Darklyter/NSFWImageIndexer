@@ -17,6 +17,25 @@ except ImportError:
     HAS_PSYCOPG2 = False
 
 _SCHEMA = 'ai_captioning'
+
+# Mirrors the engine-side guards in llmii.py process_keywords(): keywords the
+# model negated ("not nude", "non-nude", "without tattoos") or hedged
+# ("possibly nude") must never be promoted to canonical tags by the backfill
+# helpers — the raw/unmatched tables store keywords from BEFORE those guards
+# ran. Keep these in sync with _NEGATIVE_RE/_UNCERTAIN_RE in llmii.py.
+_BACKFILL_NEGATIVE_RE = re.compile(r'^(no|not|non|without)[\s-]', re.IGNORECASE)
+_BACKFILL_UNCERTAIN_RE = re.compile(
+    r'^(possibly|perhaps|probably|appears?\s+to\s+(be|have)|'
+    r'seems?\s+to\s+(be|have)|may\s+(be|have)|might\s+(be|have)|'
+    r'could\s+(be|have)|likely\s|seemingly\s|'
+    r'looks?\s+(like|as\s+if))\b',
+    re.IGNORECASE,
+)
+
+
+def _is_negated_or_uncertain(kw):
+    k = str(kw).strip()
+    return bool(_BACKFILL_NEGATIVE_RE.match(k) or _BACKFILL_UNCERTAIN_RE.match(k))
 # Sentinel value used in debug_map for blacklisted tags (matches llmii._BLACKLISTED)
 _BLACKLISTED_SENTINEL = "__blacklisted__"
 
@@ -1123,6 +1142,8 @@ def backfill_colored_hair(conn):
 
     def _classify(kw):
         """Return 'Colored Hair', 'Multicolored Hair', or None."""
+        if _is_negated_or_uncertain(kw):
+            return None
         k = kw.lower().strip()
         if not k.endswith('hair'):
             return None
@@ -1146,11 +1167,11 @@ def backfill_colored_hair(conn):
         rows = cur.fetchall()
 
     # Classify each row
-    to_promote = [
-        (image_id, run_id, kw, _classify(kw))
-        for image_id, run_id, kw in rows
-        if _classify(kw) is not None
-    ]
+    to_promote = []
+    for image_id, run_id, kw in rows:
+        c = _classify(kw)
+        if c is not None:
+            to_promote.append((image_id, run_id, kw, c))
 
     if not to_promote:
         return 0, 0
@@ -1247,6 +1268,8 @@ def backfill_normalizers(conn):
     ]
 
     def _classify(kw):
+        if _is_negated_or_uncertain(kw):
+            return None
         k = kw.lower().strip()
         # Nudity level
         for pattern, canonical in _NUDITY_RULES:
@@ -1270,11 +1293,11 @@ def backfill_normalizers(conn):
         )
         rows = cur.fetchall()
 
-    to_promote = [
-        (image_id, run_id, kw, _classify(kw))
-        for image_id, run_id, kw in rows
-        if _classify(kw) is not None
-    ]
+    to_promote = []
+    for image_id, run_id, kw in rows:
+        c = _classify(kw)
+        if c is not None:
+            to_promote.append((image_id, run_id, kw, c))
 
     if not to_promote:
         return {}
@@ -1390,6 +1413,8 @@ def backfill_from_raw(conn):
     ]
 
     def _classify(kw):
+        if _is_negated_or_uncertain(kw):
+            return None
         k = kw.lower().strip()
         for pattern, canonical in _NUDITY_RULES:
             if pattern.search(k):
@@ -1410,11 +1435,11 @@ def backfill_from_raw(conn):
         )
         rows = cur.fetchall()
 
-    to_promote = [
-        (image_id, run_id, kw, _classify(kw))
-        for image_id, run_id, kw in rows
-        if _classify(kw) is not None
-    ]
+    to_promote = []
+    for image_id, run_id, kw in rows:
+        c = _classify(kw)
+        if c is not None:
+            to_promote.append((image_id, run_id, kw, c))
 
     if not to_promote:
         return {}
@@ -1627,7 +1652,9 @@ def merge_tag(conn, source_name, target_name):
       2. Reassign source's tag_aliases to target
          (aliases that would conflict with existing target aliases are dropped)
       3. Add source tag name as an alias for target (ON CONFLICT DO NOTHING)
-      4. Delete source from tags
+      4. Remap performer_tags to target, OR-merging pinned/excluded/
+         manually_added for performers that have both tags, then delete
+         source from tags
 
     Returns the number of image_keywords rows reassigned (not deleted) to target.
     Raises ValueError if either tag is not found, or if source == target.
@@ -1695,7 +1722,41 @@ def merge_tag(conn, source_name, target_name):
             (target_id, source_name),
         )
 
-        # 4. Delete source tag (all FK references already removed above)
+        # 4a. Remap performer_tags. performer_tags.tag_id is ON DELETE
+        # CASCADE, so deleting the source tag without remapping silently
+        # destroyed every performer's pins, manual adds, and exclusion
+        # tombstones for that tag. Pairs that exist on both sides OR-merge
+        # their curation flags into the target row; pairs only on the
+        # source side are simply repointed.
+        cur.execute(
+            """
+            UPDATE performer_tags pt
+            SET pinned         = pt.pinned         OR src.pinned,
+                excluded       = pt.excluded       OR src.excluded,
+                manually_added = pt.manually_added OR src.manually_added,
+                image_count    = GREATEST(pt.image_count, src.image_count)
+            FROM performer_tags src
+            WHERE pt.tag_id  = %s
+              AND src.tag_id = %s
+              AND src.performer_id = pt.performer_id
+            """,
+            (target_id, source_id),
+        )
+        cur.execute(
+            """
+            UPDATE performer_tags pt
+            SET tag_id = %s
+            WHERE pt.tag_id = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM performer_tags t
+                  WHERE t.performer_id = pt.performer_id AND t.tag_id = %s
+              )
+            """,
+            (target_id, source_id, target_id),
+        )
+
+        # 4b. Delete source tag (remaining source-side performer_tags rows
+        # are duplicates whose flags were merged in 4a — CASCADE removes them)
         cur.execute("DELETE FROM tags WHERE id = %s", (source_id,))
 
     conn.commit()
