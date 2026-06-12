@@ -586,6 +586,9 @@ class Config:
         self.directory = None
         self.api_url = None
         self.api_password = None
+        self.lm_studio = False
+        self.lm_studio_url = "http://localhost:1234"
+        self.lm_studio_model = ""
         self.no_crawl = False
         self.no_backup = False
         self.dry_run = False
@@ -635,7 +638,7 @@ class Config:
             'Return only the JSON object: {"Keywords": []}'
         ) 
 
-        # Sampler settings
+        # KoboldCpp sampler settings
         self.temperature = 0.1
         self.top_p = 0.9
         self.rep_pen = 1.05
@@ -643,6 +646,14 @@ class Config:
         self.min_p = 0.05
         self.use_default_badwordsids = False
         self.use_json_grammar = True
+
+        # LM Studio sampler settings (independent — reasoning models need different values)
+        self.lm_studio_gen_count = 12000
+        self.lm_studio_temperature = 0.6   # Qwen3 recommended
+        self.lm_studio_top_p = 0.95        # Qwen3 recommended
+        self.lm_studio_top_k = 20          # Qwen3 recommended
+        self.lm_studio_min_p = 0.0         # not typically used with reasoning models
+        self.lm_studio_rep_pen = 1.0       # reasoning models don't need rep pen
         self.skip_folders = []
         self.rename_invalid = False
         self.preserve_date = False
@@ -795,7 +806,6 @@ Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keyw
 
 class LLMProcessor:
     def __init__(self, config):
-        self.api_url = config.api_url
         self.config = config
         self.instruction = config.instruction
         self.system_instruction = config.system_instruction
@@ -803,14 +813,25 @@ class LLMProcessor:
         self.tag_instruction = config.tag_instruction
         self.requests = requests
         self.api_password = config.api_password
-        self.max_tokens = config.gen_count
-        self.temperature = config.temperature
-        self.top_p = config.top_p
-        self.rep_pen = config.rep_pen
-        self.top_k = config.top_k
-        self.min_p = config.min_p
         self.use_default_badwordsids = config.use_default_badwordsids
         self.use_json_grammar = config.use_json_grammar
+        self.lm_studio = config.lm_studio
+        self.lm_studio_model = config.lm_studio_model
+        self.api_url = config.lm_studio_url if config.lm_studio else config.api_url
+        if config.lm_studio:
+            self.max_tokens = config.lm_studio_gen_count
+            self.temperature = config.lm_studio_temperature
+            self.top_p = config.lm_studio_top_p
+            self.top_k = config.lm_studio_top_k
+            self.min_p = config.lm_studio_min_p
+            self.rep_pen = config.lm_studio_rep_pen
+        else:
+            self.max_tokens = config.gen_count
+            self.temperature = config.temperature
+            self.top_p = config.top_p
+            self.rep_pen = config.rep_pen
+            self.top_k = config.top_k
+            self.min_p = config.min_p
 
     def describe_content(self, task="", processed_image=None, description=None):
         if task != "keywords_from_text" and not processed_image:
@@ -872,14 +893,58 @@ class LLMProcessor:
                 "top_p": self.top_p,
                 "top_k": self.top_k,
                 "min_p": self.min_p,
-                "rep_pen": self.rep_pen,
-                "use_default_badwordsids": ban_eos
             }
 
-            # Add JSON schema if grammar is enabled and task requires structured output
-            if self.use_json_grammar and task in ["caption_and_keywords", "keywords", "keywords_from_text"]:
+            if self.lm_studio:
+                # LM Studio uses OpenAI-standard repetition_penalty
+                payload["repetition_penalty"] = self.rep_pen
+                if self.lm_studio_model:
+                    payload["model"] = self.lm_studio_model
+            else:
+                # KoboldCpp-specific params
+                payload["rep_pen"] = self.rep_pen
+                payload["use_default_badwordsids"] = ban_eos
+
+            # Add JSON schema constraint if grammar is enabled and task requires structured output
+            if self.lm_studio:
+                # LM Studio requires response_format on every request and only accepts
+                # "text" or "json_schema" (not "json_object").
+                if task == "caption":
+                    payload["response_format"] = {"type": "text"}
+                elif task == "caption_and_keywords":
+                    payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "image_analysis",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "Description": {"type": "string"},
+                                    "Keywords": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                },
+                                "required": ["Description", "Keywords"]
+                            },
+                            "strict": False
+                        }
+                    }
+                elif task in ["keywords", "keywords_from_text"]:
+                    payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "keywords_response",
+                            "schema": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "strict": False
+                        }
+                    }
+            elif self.use_json_grammar and task in ["caption_and_keywords", "keywords", "keywords_from_text"]:
                 if task == "caption_and_keywords":
-                    # Schema for both description and keywords
+                    # KoboldCpp schema for both description and keywords
                     payload["response_format"] = {
                         "type": "json_object",
                         "schema": {
@@ -899,7 +964,7 @@ class LLMProcessor:
                         }
                     }
                 elif task == "keywords":
-                    # Schema for keywords only
+                    # KoboldCpp schema for keywords only
                     payload["response_format"] = {
                         "type": "json_object",
                         "schema": {
@@ -935,7 +1000,13 @@ class LLMProcessor:
 
             if "choices" in response_json and len(response_json["choices"]) > 0:
                 if "message" in response_json["choices"][0]:
-                    content = response_json["choices"][0]["message"]["content"]
+                    msg = response_json["choices"][0]["message"]
+                    content = msg.get("content") or ""
+                    # Reasoning models (e.g. Qwen3) put structured output into
+                    # reasoning_content when json_schema is active and leave
+                    # content empty — fall back to reasoning_content in that case.
+                    if not content.strip():
+                        content = msg.get("reasoning_content") or ""
                 else:
                     content = response_json["choices"][0].get("text", "")
                 # Detect degenerate looping output (same word repeated >60% of tokens)

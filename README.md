@@ -17,10 +17,11 @@ The first time you launch the tool you will be presented with a list of AI model
 - **Metadata Enhancement**: Can automatically edit image metadata with generated tags
 - **Local Processing**: All processing is done locally on your machine
 - **Multi-Format Support**: Handles a wide range of image formats, including all major raw camera files
-- **User-Friendly GUI**: Includes a GUI and installer. Relies on Koboldcpp, a single executable, for all AI functionality
+- **User-Friendly GUI**: Includes a GUI and installer. Relies on KoboldCpp or LM Studio for all AI functionality
 - **Image View**: View images step through them to review the metadata generation after they are processed
 - **Simple Model Selection**: Choose a the state of the art model and it will be automatically downloaded and configured
 - **Completely Automatic Backend Configuration**: The AI backend (KoboldCpp) will be downloaded and configured with optimal settings
+- **LM Studio Support**: Optionally use LM Studio as the inference backend instead of KoboldCpp — configure URL, model name, and toggle in Settings or `settings.json`
 - **GPU Acceleration**: Will use Apple Metal, Nvidia CUDA, or AMD (Vulkan) hardware if available to greatly speed inference
 - **Cross-Platform**: Supports Windows, macOS ARM, and Linux
 - **Stop and Start Capability**: Can stop and start without having to reprocess all the files again. Use **Resume Session** to skip already-completed files via the database or a saved checkpoint file
@@ -142,9 +143,27 @@ It is sometimes possible to get keywords or captions in a language besides Engli
 
 ### API Settings
 
-**API URL:** URL of the LLM API server. Default is `http://localhost:5001`
+**API URL:** URL of the KoboldCpp server. Default is `http://localhost:5001`
 
 **API Password:** Password for API authentication if required. Leave blank if no authentication needed.
+
+#### LM Studio (alternative backend)
+
+Check **Use LM Studio instead of KoboldCpp** to route all inference through an LM Studio server instead. Three additional fields become active:
+
+| Setting | Description | Default |
+|---|---|---|
+| URL | LM Studio server address | `http://localhost:1234` |
+| Model | Exact model identifier as shown in LM Studio | *(required)* |
+
+These can also be set directly in `settings.json`:
+```json
+"lm_studio": true,
+"lm_studio_url": "http://localhost:1234",
+"lm_studio_model": "lmstudio-community/Qwen3-VL-8B-Instruct-GGUF"
+```
+
+When LM Studio is active the KoboldCpp URL and password fields are disabled. The API status indicator checks LM Studio's `/v1/models` endpoint to confirm the server is ready.
 
 ### Instruction Settings
 

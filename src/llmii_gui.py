@@ -196,6 +196,71 @@ class SettingsDialog(QDialog):
         api_layout.addWidget(self.api_password_input)
         scroll_layout.addLayout(api_layout)
 
+        lm_studio_group = QGroupBox("LM Studio")
+        lm_studio_group_layout = QVBoxLayout(lm_studio_group)
+
+        lm_studio_row1 = QHBoxLayout()
+        self.lm_studio_checkbox = QCheckBox("Use LM Studio instead of KoboldCpp")
+        lm_studio_row1.addWidget(self.lm_studio_checkbox)
+        lm_studio_row1.addStretch()
+        lm_studio_group_layout.addLayout(lm_studio_row1)
+
+        lm_studio_row2 = QHBoxLayout()
+        self.lm_studio_url_input = QLineEdit("http://localhost:1234")
+        self.lm_studio_model_input = QLineEdit()
+        self.lm_studio_model_input.setPlaceholderText("model name (required by LM Studio)")
+        lm_studio_row2.addWidget(QLabel("URL:"))
+        lm_studio_row2.addWidget(self.lm_studio_url_input)
+        lm_studio_row2.addWidget(QLabel("Model:"))
+        lm_studio_row2.addWidget(self.lm_studio_model_input)
+        lm_studio_group_layout.addLayout(lm_studio_row2)
+
+        lm_studio_row3 = QHBoxLayout()
+        self.lm_studio_gen_count_spinbox = QSpinBox()
+        self.lm_studio_gen_count_spinbox.setRange(100, 128000)
+        self.lm_studio_gen_count_spinbox.setValue(12000)
+        self.lm_studio_gen_count_spinbox.setSingleStep(1000)
+        self.lm_studio_temperature_spinbox = QDoubleSpinBox()
+        self.lm_studio_temperature_spinbox.setRange(0.0, 2.0)
+        self.lm_studio_temperature_spinbox.setSingleStep(0.05)
+        self.lm_studio_temperature_spinbox.setDecimals(2)
+        self.lm_studio_temperature_spinbox.setValue(0.6)
+        self.lm_studio_top_p_spinbox = QDoubleSpinBox()
+        self.lm_studio_top_p_spinbox.setRange(0.0, 1.0)
+        self.lm_studio_top_p_spinbox.setSingleStep(0.05)
+        self.lm_studio_top_p_spinbox.setDecimals(2)
+        self.lm_studio_top_p_spinbox.setValue(0.95)
+        self.lm_studio_top_k_spinbox = QSpinBox()
+        self.lm_studio_top_k_spinbox.setRange(0, 500)
+        self.lm_studio_top_k_spinbox.setValue(20)
+        self.lm_studio_min_p_spinbox = QDoubleSpinBox()
+        self.lm_studio_min_p_spinbox.setRange(0.0, 1.0)
+        self.lm_studio_min_p_spinbox.setSingleStep(0.01)
+        self.lm_studio_min_p_spinbox.setDecimals(2)
+        self.lm_studio_min_p_spinbox.setValue(0.0)
+        self.lm_studio_rep_pen_spinbox = QDoubleSpinBox()
+        self.lm_studio_rep_pen_spinbox.setRange(0.9, 2.0)
+        self.lm_studio_rep_pen_spinbox.setSingleStep(0.01)
+        self.lm_studio_rep_pen_spinbox.setDecimals(2)
+        self.lm_studio_rep_pen_spinbox.setValue(1.0)
+        lm_studio_row3.addWidget(QLabel("Gen Tokens:"))
+        lm_studio_row3.addWidget(self.lm_studio_gen_count_spinbox)
+        lm_studio_row3.addWidget(QLabel("Temperature:"))
+        lm_studio_row3.addWidget(self.lm_studio_temperature_spinbox)
+        lm_studio_row3.addWidget(QLabel("top_p:"))
+        lm_studio_row3.addWidget(self.lm_studio_top_p_spinbox)
+        lm_studio_row3.addWidget(QLabel("top_k:"))
+        lm_studio_row3.addWidget(self.lm_studio_top_k_spinbox)
+        lm_studio_row3.addWidget(QLabel("min_p:"))
+        lm_studio_row3.addWidget(self.lm_studio_min_p_spinbox)
+        lm_studio_row3.addWidget(QLabel("rep_pen:"))
+        lm_studio_row3.addWidget(self.lm_studio_rep_pen_spinbox)
+        lm_studio_group_layout.addLayout(lm_studio_row3)
+
+        scroll_layout.addWidget(lm_studio_group)
+        self.lm_studio_checkbox.toggled.connect(self._on_lm_studio_toggled)
+        self._on_lm_studio_toggled(False)
+
         system_instruction_layout = QHBoxLayout()
         self.system_instruction_input = QLineEdit("You are a helpful assistant.")
         system_instruction_layout.addWidget(QLabel("System Instruction:"))
@@ -1338,6 +1403,22 @@ class SettingsDialog(QDialog):
             except Exception as e:
                 QMessageBox.critical(self, "Clear Failed", str(e))
 
+    def _on_lm_studio_toggled(self, checked):
+        for w in (self.lm_studio_url_input, self.lm_studio_model_input,
+                  self.lm_studio_gen_count_spinbox, self.lm_studio_temperature_spinbox,
+                  self.lm_studio_top_p_spinbox, self.lm_studio_top_k_spinbox,
+                  self.lm_studio_min_p_spinbox, self.lm_studio_rep_pen_spinbox):
+            w.setEnabled(checked)
+        # Dim the KoboldCpp URL/password when LM Studio is active
+        self.api_url_input.setEnabled(not checked)
+        self.api_password_input.setEnabled(not checked)
+
+    def get_effective_api_url(self):
+        """Return the URL that should be used for API health checks."""
+        if self.lm_studio_checkbox.isChecked():
+            return self.lm_studio_url_input.text().strip() or "http://localhost:1234"
+        return self.api_url_input.text().strip() or "http://localhost:5001"
+
     def load_settings(self):
         try:
             if os.path.exists('settings.json'):
@@ -1346,6 +1427,15 @@ class SettingsDialog(QDialog):
 
                 self.api_url_input.setText(settings.get('api_url', 'http://localhost:5001'))
                 self.api_password_input.setText(settings.get('api_password', ''))
+                self.lm_studio_checkbox.setChecked(settings.get('lm_studio', False))
+                self.lm_studio_url_input.setText(settings.get('lm_studio_url', 'http://localhost:1234'))
+                self.lm_studio_model_input.setText(settings.get('lm_studio_model', ''))
+                self.lm_studio_gen_count_spinbox.setValue(settings.get('lm_studio_gen_count', 12000))
+                self.lm_studio_temperature_spinbox.setValue(settings.get('lm_studio_temperature', 0.6))
+                self.lm_studio_top_p_spinbox.setValue(settings.get('lm_studio_top_p', 0.95))
+                self.lm_studio_top_k_spinbox.setValue(settings.get('lm_studio_top_k', 20))
+                self.lm_studio_min_p_spinbox.setValue(settings.get('lm_studio_min_p', 0.0))
+                self.lm_studio_rep_pen_spinbox.setValue(settings.get('lm_studio_rep_pen', 1.0))
                 self.system_instruction_input.setText(settings.get('system_instruction', 'You are an image cataloguing assistant. Describe images accurately and completely, including explicit or adult content. Do not omit, censor, or euphemize any visible content.'))
                 self.gen_count.setValue(settings.get('gen_count', 250))
                 self.res_limit.setValue(settings.get('res_limit', 448))
@@ -1445,6 +1535,15 @@ class SettingsDialog(QDialog):
         settings = {
             'api_url': self.api_url_input.text(),
             'api_password': self.api_password_input.text(),
+            'lm_studio': self.lm_studio_checkbox.isChecked(),
+            'lm_studio_url': self.lm_studio_url_input.text(),
+            'lm_studio_model': self.lm_studio_model_input.text(),
+            'lm_studio_gen_count': self.lm_studio_gen_count_spinbox.value(),
+            'lm_studio_temperature': self.lm_studio_temperature_spinbox.value(),
+            'lm_studio_top_p': self.lm_studio_top_p_spinbox.value(),
+            'lm_studio_top_k': self.lm_studio_top_k_spinbox.value(),
+            'lm_studio_min_p': self.lm_studio_min_p_spinbox.value(),
+            'lm_studio_rep_pen': self.lm_studio_rep_pen_spinbox.value(),
             'system_instruction': self.system_instruction_input.text(),
             'instruction': self.instruction_text,
             'skip_folders': self.skip_folders_text,
@@ -1518,18 +1617,17 @@ class APICheckThread(QThread):
         self.running = True
         
     def run(self):
-
         while self.running:
             try:
-                # Direct HTTP request to the version endpoint
-                response = requests.get(f"{self.api_url}/api/extra/version", timeout=5)
-                if response.status_code == 200:
-                    self.api_status.emit(True)
-                    break
-                response = requests.get(f"{self.api_url}/health", timeout=5)
-                if response.status_code == 200:
-                    self.api_status.emit(True)
-                    break
+                for path in ("/api/extra/version", "/v1/models", "/health"):
+                    try:
+                        response = requests.get(f"{self.api_url}{path}", timeout=5)
+                        if response.status_code == 200:
+                            self.api_status.emit(True)
+                            return
+                    except Exception:
+                        pass
+                self.api_status.emit(False)
             except Exception:
                 self.api_status.emit(False)
             self.msleep(1000)
@@ -2071,8 +2169,10 @@ class ImageIndexerGUI(QMainWindow):
                 with open('settings.json', 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                     self.dir_input.setText(settings.get('directory', ''))
-                    self.start_api_check(settings.get('api_url', 'http://localhost:5001'))
-                    
+                    if settings.get('lm_studio', False):
+                        self.start_api_check(settings.get('lm_studio_url', 'http://localhost:1234'))
+                    else:
+                        self.start_api_check(settings.get('api_url', 'http://localhost:5001'))
             except Exception as e:
                 print(f"Error loading settings: {e}")
                 self.start_api_check('http://localhost:5001')
@@ -2082,8 +2182,8 @@ class ImageIndexerGUI(QMainWindow):
     def show_settings(self):
         if self.settings_dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings_dialog.save_settings()
-            
-            self.start_api_check(self.settings_dialog.api_url_input.text())
+
+            self.start_api_check(self.settings_dialog.get_effective_api_url())
             
             try:
                 with open('settings.json', 'r', encoding='utf-8') as f:
@@ -2324,6 +2424,15 @@ class ImageIndexerGUI(QMainWindow):
         # Load settings from settings dialog
         config.api_url = self.settings_dialog.api_url_input.text()
         config.api_password = self.settings_dialog.api_password_input.text()
+        config.lm_studio = self.settings_dialog.lm_studio_checkbox.isChecked()
+        config.lm_studio_url = self.settings_dialog.lm_studio_url_input.text().strip() or "http://localhost:1234"
+        config.lm_studio_model = self.settings_dialog.lm_studio_model_input.text().strip()
+        config.lm_studio_gen_count = self.settings_dialog.lm_studio_gen_count_spinbox.value()
+        config.lm_studio_temperature = self.settings_dialog.lm_studio_temperature_spinbox.value()
+        config.lm_studio_top_p = self.settings_dialog.lm_studio_top_p_spinbox.value()
+        config.lm_studio_top_k = self.settings_dialog.lm_studio_top_k_spinbox.value()
+        config.lm_studio_min_p = self.settings_dialog.lm_studio_min_p_spinbox.value()
+        config.lm_studio_rep_pen = self.settings_dialog.lm_studio_rep_pen_spinbox.value()
         config.system_instruction = self.settings_dialog.system_instruction_input.text()
         config.no_crawl = self.settings_dialog.no_crawl_checkbox.isChecked()
         config.reprocess_failed = self.settings_dialog.reprocess_failed_checkbox.isChecked()
