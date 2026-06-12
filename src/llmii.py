@@ -2012,6 +2012,28 @@ class FileProcessor:
 
         return False
 
+    def _get_tags_resilient(self, files, tags, params):
+        """Fetch tags for a batch of files, falling back to per-file reads
+        when the batch call fails.
+
+        exiftool exits non-zero if ANY file in the argument list cannot be
+        read (deleted mid-run, locked, permission denied), and pyexiftool
+        raises ExifToolExecuteError for the whole command. Without this
+        fallback one bad file silently dropped the entire batch.
+        """
+        try:
+            return self.et.get_tags(files, tags=tags, params=params)
+        except exiftool.exceptions.ExifToolExecuteError:
+            results = []
+            for f in files:
+                try:
+                    results.extend(self.et.get_tags([f], tags=tags, params=params))
+                except Exception as e:
+                    print(f"Unreadable file skipped: {f} ({type(e).__name__})")
+                    self.callback(f"Unreadable file skipped: {os.path.basename(f)}")
+                    self.failed_validations.append(f)
+            return results
+
     def _get_metadata_batch(self, files):
         """ Get metadata for a batch of files
             using persistent ExifTool instance.
@@ -2037,7 +2059,7 @@ class FileProcessor:
                     else:
                         xmp_files.append(file)
                 files = xmp_files
-            results = self.et.get_tags(files, tags=exiftool_fields, params=params)
+            results = self._get_tags_resilient(files, tags=exiftool_fields, params=params)
 
             # Always source content/tracking fields from JSON sidecar instead of EXIF
             fields_to_clear = set(self.keyword_fields + self.caption_fields +
