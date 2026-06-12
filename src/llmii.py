@@ -744,7 +744,11 @@ Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keyw
 
     @classmethod
     def from_args(cls):
-        parser = argparse.ArgumentParser(description="Image Indexer")
+        # argument_default=SUPPRESS keeps unsupplied options out of the
+        # namespace so they don't clobber Config.__init__ defaults below.
+        parser = argparse.ArgumentParser(
+            description="Image Indexer", argument_default=argparse.SUPPRESS
+        )
         parser.add_argument("directory", help="Directory containing the files")
         parser.add_argument(
             "--api-url", default="http://localhost:5001", help="URL for the LLM API"
@@ -779,7 +783,7 @@ Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keyw
             "--update-keywords", action="store_true", help="Update existing keyword metadata"
         )
         parser.add_argument(
-            "--gen-count", default=150, help="Number of tokens to generate"
+            "--gen-count", type=int, help="Number of tokens to generate"
         )
         parser.add_argument("--detailed-caption", action="store_true", help="Write a detailed caption along with keywords")
         parser.add_argument(
@@ -792,9 +796,9 @@ Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keyw
         parser.add_argument(
             "--normalize-keywords", action="store_true", help="Enable keyword normalization"
         )
-        parser.add_argument("--res-limit", type=int, default=448, help="Limit the resolution of the image")
-        parser.add_argument("--rename-invalid", type="store_true", help="Use rename invalid files so they don't get reprocessed")
-        parser.add_argument("--preserve-date", type="store_true", help="Keep the original modified date, but will use a temp file when writing")
+        parser.add_argument("--res-limit", type=int, help="Limit the resolution of the image")
+        parser.add_argument("--rename-invalid", action="store_true", help="Use rename invalid files so they don't get reprocessed")
+        parser.add_argument("--preserve-date", action="store_true", help="Keep the original modified date, but will use a temp file when writing")
         args = parser.parse_args()
 
         config = cls()
