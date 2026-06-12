@@ -437,6 +437,12 @@ class BulkAssignDialog(QDialog):
             tag_id = row[0]
 
             for keyword in keywords:
+                # Per-keyword SAVEPOINT: a failure rolls back only this
+                # keyword's statements. A full conn.rollback() here used to
+                # discard every previously-succeeded keyword in the batch
+                # while still reporting them as assigned and removing them
+                # from the review queue.
+                cur.execute("SAVEPOINT bulk_kw")
                 try:
                     # Alias: keyword → tag  (skip if already aliased to this tag)
                     cur.execute("""
@@ -453,20 +459,20 @@ class BulkAssignDialog(QDialog):
                         WHERE iku.keyword = %s
                         ON CONFLICT DO NOTHING
                     """, (tag_id, keyword))
-                    total_moved += cur.rowcount
+                    moved = cur.rowcount
 
                     # Remove from unmatched
                     cur.execute(
                         "DELETE FROM image_keywords_unmatched WHERE keyword = %s",
                         (keyword,),
                     )
+                    cur.execute("RELEASE SAVEPOINT bulk_kw")
+                    total_moved += moved
                     assigned.append(keyword)
 
                 except Exception as e:
-                    self.conn.rollback()
+                    cur.execute("ROLLBACK TO SAVEPOINT bulk_kw")
                     failed.append(f"{keyword}: {e}")
-                    # Re-open transaction for next keyword
-                    cur = self.conn.cursor()
 
             self.conn.commit()
 
