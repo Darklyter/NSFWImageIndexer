@@ -1177,7 +1177,11 @@ class FileProcessor:
         # Maps temp_file_path → (composite_db_key, zip_source_name, zip_studio, [zip_performers])
         self._zip_file_map = {}
         _temp_folder = getattr(config, 'temp_folder', 'temp') or 'temp'
-        self.temp_dir = Path(_temp_folder) if Path(_temp_folder).is_absolute() else Path(os.getcwd()) / _temp_folder
+        _temp_base = Path(_temp_folder) if Path(_temp_folder).is_absolute() else Path(os.getcwd()) / _temp_folder
+        # Namespaced subdirectory: _clear_temp_dir recursively deletes this
+        # path, so it must never point at a generic cwd-relative 'temp'
+        # folder that could belong to something else.
+        self.temp_dir = _temp_base / "llmii_zip_extract"
 
         # Progress state — updated throughout processing; emitted to the GUI via callback.
         self._progress = {
@@ -1694,11 +1698,22 @@ class FileProcessor:
             self.callback({'type': 'progress', **self._progress})
 
     def _clear_temp_dir(self):
-        """Remove and recreate the temp extraction directory."""
+        """Remove stale zip extraction leftovers from previous runs.
+
+        Safety: only deletes the namespaced extraction dir, and only when it
+        carries the marker file proving this tool created it. The directory
+        is not recreated here — _extract_single_zip creates it on demand, so
+        zip-less runs leave no empty folders behind.
+        """
         try:
-            if self.temp_dir.exists():
-                shutil.rmtree(self.temp_dir)
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            if not self.temp_dir.exists():
+                return
+            marker = self.temp_dir / ".llmii_temp"
+            if not marker.exists():
+                print(f"Warning: not clearing {self.temp_dir} "
+                      f"(missing marker file — directory not created by this tool)")
+                return
+            shutil.rmtree(self.temp_dir)
             print(f"Temp directory cleared: {self.temp_dir}")
         except Exception as e:
             print(f"Warning: could not clear temp directory {self.temp_dir}: {e}")
@@ -1807,6 +1822,9 @@ class FileProcessor:
 
                 print(f"Extracting {len(to_extract)}/{len(internal_images)} image(s) from: {zip_source_name}")
                 zip_temp_dir.mkdir(parents=True, exist_ok=True)
+                # Marker proves this tool owns the extraction dir so
+                # _clear_temp_dir may safely rmtree it next run.
+                (self.temp_dir / ".llmii_temp").touch()
                 for info in to_extract:
                     composite_key = composites[info.filename]
                     try:
