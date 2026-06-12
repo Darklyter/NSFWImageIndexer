@@ -1,6 +1,8 @@
 {
     "api_url": "http://localhost:5001",
     "api_password": "",
+    "_comment_kobold_gpu_device": "Pin KoboldCpp to one GPU when launched from the launcher. '' = use all GPUs (default; KoboldCpp may split a model across cards). A CUDA index like '1' (PCI-bus order) or a 'GPU-<uuid>' string pins to one card.",
+    "kobold_gpu_device": "",
     "lm_studio": false,
     "lm_studio_url": "http://localhost:1234",
     "lm_studio_model": "",

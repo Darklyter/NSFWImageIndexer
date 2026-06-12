@@ -36,9 +36,37 @@ class Colors:
 SCRIPT_DIR = Path(__file__).parent
 RESOURCES_DIR = SCRIPT_DIR / "resources"
 KOBOLD_ARGS_PATH = RESOURCES_DIR / "kobold_args.json"
+SETTINGS_PATH = SCRIPT_DIR / "settings.json"
 
 # Track koboldcpp process for cleanup only
 _kobold_process = None
+
+
+def _gpu_pin_env():
+    """Return an environment dict that pins KoboldCpp to a single GPU,
+    or None to leave the default multi-GPU behavior alone.
+
+    Reads settings.json key 'kobold_gpu_device':
+        ""  / absent  → use all detected GPUs (KoboldCpp autofits/splits)
+        "0", "1", ... → pin to that CUDA device index (PCI-bus order)
+        "GPU-<uuid>"  → pin to that exact card (order-independent, safest)
+
+    Without a pin, KoboldCpp splits the model across every visible GPU,
+    which spills onto a second card and adds PCIe latency even when the
+    model fits on one card.
+    """
+    try:
+        with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
+            device = (json.load(f).get('kobold_gpu_device') or '').strip()
+    except Exception:
+        device = ''
+    if not device:
+        return None
+    env = os.environ.copy()
+    # PCI-bus order makes a numeric index map to the same card every time.
+    env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    env['CUDA_VISIBLE_DEVICES'] = device
+    return env
 
 
 def check_dependencies():
@@ -184,6 +212,12 @@ def launch_model():
         if config.get('flashattention', False):
             cmd.append("--flashattention")
 
+        # Optional single-GPU pin (settings.json: kobold_gpu_device).
+        gpu_env = _gpu_pin_env()
+        if gpu_env is not None:
+            print(f"{Colors.CYAN}Pinning to GPU "
+                  f"{gpu_env['CUDA_VISIBLE_DEVICES']} (CUDA_VISIBLE_DEVICES).{Colors.NC}")
+
         print(f"{Colors.GREEN}Launching koboldcpp...{Colors.NC}")
 
         # Make executable on Unix
@@ -193,15 +227,21 @@ def launch_model():
         # Launch in new window based on platform
         system = platform.system()
         if system == "Windows":
-            _kobold_process = subprocess.Popen(cmd, cwd=working_dir, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            _kobold_process = subprocess.Popen(
+                cmd, cwd=working_dir,
+                creationflags=subprocess.CREATE_NEW_CONSOLE, env=gpu_env)
         elif system == "Darwin":
             # macOS - escape quotes for AppleScript
             def escape_applescript(s):
                 return str(s).replace('\\', '\\\\').replace('"', '\\"')
 
+            env_prefix = ""
+            if gpu_env is not None:
+                env_prefix = (f"export CUDA_DEVICE_ORDER=PCI_BUS_ID && "
+                              f"export CUDA_VISIBLE_DEVICES={escape_applescript(gpu_env['CUDA_VISIBLE_DEVICES'])} && ")
             cmd_str = ' '.join([f'\\"{escape_applescript(arg)}\\"' for arg in cmd])
             working_dir_escaped = escape_applescript(working_dir)
-            applescript = f'tell application "Terminal" to do script "cd \\"{working_dir_escaped}\\" && {cmd_str}"'
+            applescript = f'tell application "Terminal" to do script "cd \\"{working_dir_escaped}\\" && {env_prefix}{cmd_str}"'
             subprocess.run(["osascript", "-e", applescript])
             # Save exe name for cleanup
             _kobold_process = exe_path.name
@@ -212,7 +252,11 @@ def launch_model():
             # shlex.quote: naive double-quoting broke (or executed!) paths
             # and URLs containing $, backticks, or quotes inside bash -c
             cmd_str = ' '.join(shlex.quote(str(arg)) for arg in cmd)
-            inner = f"cd {shlex.quote(str(working_dir))} && {cmd_str}; exec bash"
+            env_prefix = ""
+            if gpu_env is not None:
+                env_prefix = (f"export CUDA_DEVICE_ORDER=PCI_BUS_ID && "
+                              f"export CUDA_VISIBLE_DEVICES={shlex.quote(gpu_env['CUDA_VISIBLE_DEVICES'])} && ")
+            inner = f"cd {shlex.quote(str(working_dir))} && {env_prefix}{cmd_str}; exec bash"
             try:
                 subprocess.Popen([terminal, "-e", f"bash -c {shlex.quote(inner)}"])
                 # Save exe name for cleanup
