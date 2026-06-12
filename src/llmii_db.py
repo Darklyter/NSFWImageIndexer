@@ -313,10 +313,24 @@ def apply_migrations(conn):
         # tags: global flag to exclude a tag from all performer_tags
         "ALTER TABLE tags ADD COLUMN IF NOT EXISTS exclude_from_performers BOOLEAN NOT NULL DEFAULT FALSE",
     ]
+    # Each migration runs under its own SAVEPOINT so one failing statement
+    # (e.g. on a partially-built or divergent schema) neither aborts the
+    # remaining migrations nor leaves the connection in the
+    # "current transaction is aborted" state for the caller.
+    failures = []
     with conn.cursor() as cur:
         for sql in migrations:
-            cur.execute(sql)
+            cur.execute("SAVEPOINT migration_step")
+            try:
+                cur.execute(sql)
+                cur.execute("RELEASE SAVEPOINT migration_step")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT migration_step")
+                failures.append(f"{e} -- in: {' '.join(sql.split())[:90]}")
     conn.commit()
+    if failures:
+        for f in failures:
+            print(f"Warning: migration step failed: {f}")
 
 
 def get_connection(host, port, user, password, dbname, apply_schema_migrations=True):
@@ -345,6 +359,13 @@ def get_connection(host, port, user, password, dbname, apply_schema_migrations=T
         try:
             apply_migrations(conn)
         except Exception as e:
+            # Leave the connection usable — without this rollback the
+            # caller receives a connection stuck in the aborted-transaction
+            # state and every subsequent query fails.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             print(f"Warning: schema migration error: {e}")
     return conn
 
