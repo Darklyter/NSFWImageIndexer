@@ -20,6 +20,7 @@ Run from the project root:
 
 import sys
 import json
+import re
 import string
 from pathlib import Path
 
@@ -61,6 +62,11 @@ try:
 except ImportError:
     _llmii_db = None
     _HAS_LLMII_DB = False
+
+# Engine default for the fuzzy-match threshold. Kept in sync with
+# llmii.TagMatcher.FUZZY_THRESHOLD (importing llmii here would pull in
+# exiftool/rawpy, which this standalone tool doesn't need).
+_ENGINE_FUZZY_DEFAULT = 85
 
 
 def _load_settings():
@@ -437,6 +443,23 @@ class BulkAssignDialog(QDialog):
             tag_id = row[0]
 
             for keyword in keywords:
+                # Existing alias pointing at a DIFFERENT tag: skip rather
+                # than silently promoting the keyword here while its alias
+                # keeps routing future runs elsewhere. (The single-assign
+                # path asks the user; bulk mode reports it.)
+                cur.execute("""
+                    SELECT t.tag
+                    FROM tag_aliases ta
+                    JOIN tags t ON t.id = ta.tag_id
+                    WHERE ta.alias = %s
+                """, (keyword,))
+                row_alias = cur.fetchone()
+                if row_alias and row_alias[0] != tag:
+                    failed.append(
+                        f"{keyword}: already aliased to '{row_alias[0]}' "
+                        f"— use single Assign to reassign")
+                    continue
+
                 # Per-keyword SAVEPOINT: a failure rolls back only this
                 # keyword's statements. A full conn.rollback() here used to
                 # discard every previously-succeeded keyword in the batch
@@ -743,8 +766,11 @@ class ManageTagsDialog(QDialog):
         )
         if not ok:
             return
-        new_name = string.capwords(new_name.strip())
-        if not new_name or new_name.lower() == source.lower():
+        # Preserve the user's casing (capwords mangled acronyms like BDSM
+        # → Bdsm) and allow case-only renames — they're the only way to
+        # fix a tag's casing.
+        new_name = new_name.strip()
+        if not new_name or new_name == source:
             return
 
         try:
@@ -1227,15 +1253,24 @@ class TagReviewWindow(QMainWindow):
 
     def _compute_near_misses(self, keyword, floor=55, limit=5):
         """Return [(tag_name, score)] for tags that are close but below the match
-        threshold.  Uses the same scorer as TagMatcher.match()."""
+        threshold.
+
+        Approximate: uses TagMatcher.match()'s scorer (token_sort_ratio) and
+        normalization, but matches canonical tag names only — the engine also
+        matches every alias and applies a gender-conflict filter, so scores
+        here can differ slightly from what the pipeline did."""
         try:
             from rapidfuzz import process as rfprocess, fuzz as rffuzz
         except ImportError:
             return []
-        # Load threshold from settings (default 90, matches TagMatcher default)
+        # Default must track the ENGINE default (TagMatcher.FUZZY_THRESHOLD
+        # = 85); the old hardcoded 90 disagreed with what the pipeline
+        # actually auto-matched when settings.json had no override.
         settings = _load_settings()
-        threshold = settings.get('tag_fuzzy_threshold', 90)
-        k = keyword.lower()
+        threshold = settings.get('tag_fuzzy_threshold', _ENGINE_FUZZY_DEFAULT)
+        # Mirror TagMatcher._normalize: lowercase, strip punctuation,
+        # collapse whitespace.
+        k = re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', keyword.lower())).strip()
         tags_lower = [t.lower() for t in self.all_tags]
         results = rfprocess.extract(
             k, tags_lower,
@@ -1353,6 +1388,11 @@ class TagReviewWindow(QMainWindow):
         self._repopulate_tags(self.all_tags)
         self.tag_list.clearSelection()
         self.assign_btn.setEnabled(False)
+        # Re-enable action buttons: after the done state (which disables
+        # them) the user can lower 'Min occurrences' and Apply, and these
+        # stayed permanently dead until an app restart.
+        self.new_tag_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
         self.sel_label.setText("No tag selected")
         self.sel_label.setStyleSheet("color: #888;")
 
@@ -1376,14 +1416,28 @@ class TagReviewWindow(QMainWindow):
 
         cur = self.conn.cursor()
         try:
-            cur.execute("""
-                SELECT DISTINCT i.path, d.description
-                FROM image_keywords_unmatched iku
-                JOIN images i ON i.id = iku.image_id
-                LEFT JOIN image_descriptions d ON d.image_id = i.id
-                WHERE iku.keyword = %s
-                ORDER BY i.path
-            """, (keyword,))
+            if self._performer_filter:
+                # Keep the image browser consistent with the filtered
+                # queue — it used to show images from ALL performers.
+                cur.execute("""
+                    SELECT DISTINCT i.path, d.description
+                    FROM image_keywords_unmatched iku
+                    JOIN images i ON i.id = iku.image_id
+                    JOIN image_performers ip ON ip.image_id = i.id
+                    JOIN performers p ON p.id = ip.performer_id
+                    LEFT JOIN image_descriptions d ON d.image_id = i.id
+                    WHERE iku.keyword = %s AND p.name = %s
+                    ORDER BY i.path
+                """, (keyword, self._performer_filter))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT i.path, d.description
+                    FROM image_keywords_unmatched iku
+                    JOIN images i ON i.id = iku.image_id
+                    LEFT JOIN image_descriptions d ON d.image_id = i.id
+                    WHERE iku.keyword = %s
+                    ORDER BY i.path
+                """, (keyword,))
             self._image_paths = cur.fetchall()  # [(path, description), ...]
         except Exception:
             self.conn.rollback()
@@ -1419,6 +1473,14 @@ class TagReviewWindow(QMainWindow):
 
         self._cached_pixmap = None
         self.img_label.clear()
+        if '::' in path:
+            # Composite key: the image lives inside a zip archive and was
+            # extracted to a temp dir that no longer exists.
+            zip_part, member = path.split('::', 1)
+            self.img_label.setText(
+                f"(inside zip archive)\n{Path(zip_part).name}\n{member}"
+            )
+            return
         self.img_label.setText("Image cannot be loaded")
         try:
             px = QPixmap(path)
@@ -1474,6 +1536,11 @@ class TagReviewWindow(QMainWindow):
             self.assign_btn.setEnabled(False)
 
     def _assign(self):
+        # Done-state guard: the tag list stays populated after the queue is
+        # exhausted, and double-click / search-Enter still reach here — the
+        # unguarded index crashed the app with IndexError.
+        if self.current_idx >= len(self.keywords):
+            return
         items = self.tag_list.selectedItems()
         if not items:
             return
@@ -1584,7 +1651,11 @@ class TagReviewWindow(QMainWindow):
         )
         if not ok:
             return
-        tag_name = string.capwords(tag_name.strip())
+        # Preserve casing exactly as typed; only title-case fully-lowercase
+        # input (capwords mangled acronyms: BDSM -> Bdsm).
+        tag_name = tag_name.strip()
+        if tag_name and tag_name == tag_name.lower():
+            tag_name = string.capwords(tag_name)
         if not tag_name:
             QMessageBox.warning(self, "Empty Name", "Tag name cannot be empty.")
             return
@@ -1614,8 +1685,32 @@ class TagReviewWindow(QMainWindow):
             else:
                 tag_id = row[0]
 
-            # Add alias if keyword differs from the tag name
-            if keyword.lower() != tag_name.lower():
+            # Existing alias pointing at a DIFFERENT tag: ask, exactly like
+            # the single-assign path (ON CONFLICT DO NOTHING silently left
+            # the alias routing future runs to the other tag).
+            cur.execute("""
+                SELECT t.tag
+                FROM tag_aliases ta
+                JOIN tags t ON t.id = ta.tag_id
+                WHERE ta.alias = %s
+            """, (keyword,))
+            existing_alias = cur.fetchone()
+            if existing_alias and existing_alias[0].lower() != tag_name.lower():
+                reply = QMessageBox.question(
+                    self,
+                    "Alias already exists",
+                    f"'{keyword}' is currently aliased to '{existing_alias[0]}'.\n\n"
+                    f"Reassign it to '{tag_name}' instead?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.conn.rollback()
+                    return
+                cur.execute(
+                    "UPDATE tag_aliases SET tag_id = %s WHERE alias = %s",
+                    (tag_id, keyword),
+                )
+            elif keyword.lower() != tag_name.lower():
                 cur.execute("""
                     INSERT INTO tag_aliases (tag_id, alias)
                     VALUES (%s, %s)
@@ -1648,9 +1743,12 @@ class TagReviewWindow(QMainWindow):
         finally:
             cur.close()
 
-        # Add the new tag to the local list so it appears in the picker immediately
-        self.all_tags = sorted(self.all_tags + [tag_name], key=str.lower)
-        self._repopulate_tags(self.all_tags)
+        # Add the new tag to the local list so it appears in the picker
+        # immediately — but only when it's actually new (re-adding an
+        # existing tag duplicated the picker entry).
+        if tag_name.lower() not in {t.lower() for t in self.all_tags}:
+            self.all_tags = sorted(self.all_tags + [tag_name], key=str.lower)
+            self._repopulate_tags(self.all_tags)
 
         if deleted == 0:
             self.statusBar().showMessage(
@@ -1713,15 +1811,24 @@ class TagReviewWindow(QMainWindow):
     def _remove_keywords(self, keywords):
         """Drop keywords from in-memory lists after a bulk-assign operation."""
         s = set(keywords)
+        # Capture what's on screen BEFORE the lists shift — removing items
+        # positioned before it desynced current_idx from the display, so a
+        # subsequent Assign/Skip acted on a different keyword than shown.
+        displayed = (self.keywords[self.current_idx][0]
+                     if self.current_idx < len(self.keywords) else None)
         self.all_keywords = [(k, c) for k, c in self.all_keywords if k not in s]
         self.keywords = [(k, c) for k, c in self.keywords if k not in s]
-        # If the currently displayed keyword was one of those removed, advance
-        if self.current_idx < len(self.keywords):
-            current_kw = self.keywords[self.current_idx][0]
-            if current_kw in s:
-                self._show_current()
-        else:
-            self._show_current()
+
+        if displayed is not None and displayed not in s:
+            # The displayed keyword survived — re-point current_idx at its
+            # new position (the screen content is still correct).
+            for i, (k, _c) in enumerate(self.keywords):
+                if k == displayed:
+                    self.current_idx = i
+                    return
+        # Displayed keyword was removed (or list exhausted): clamp & refresh
+        self.current_idx = min(self.current_idx, len(self.keywords))
+        self._show_current()
 
     def _show_all_keywords(self):
         """Open (or raise) the full keyword list dialog."""
@@ -1795,7 +1902,20 @@ def main():
         )
         sys.exit(1)
 
-    window = TagReviewWindow(conn, performer_filter=args.performer)
+    try:
+        window = TagReviewWindow(conn, performer_filter=args.performer)
+    except Exception as e:
+        # Startup query failures (schema mismatch, transient DB errors)
+        # used to bypass the QMessageBox UX and die with a bare traceback.
+        QMessageBox.critical(
+            None, "Startup Failed",
+            f"Could not load review data:\n\n{e}",
+        )
+        try:
+            conn.close()
+        except Exception:
+            pass
+        sys.exit(1)
     window.show()
     sys.exit(app.exec())
 
