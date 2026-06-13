@@ -959,6 +959,40 @@ class TagReviewWindow(QMainWindow):
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(10)
 
+        # ── Far left: review queue (jump between keywords without Skip) ──
+        queue_panel = QWidget()
+        queue_panel.setMaximumWidth(260)
+        queue_col = QVBoxLayout(queue_panel)
+        queue_col.setSpacing(4)
+        queue_col.setContentsMargins(0, 0, 0, 0)
+
+        self.queue_header = QLabel("Queue")
+        self.queue_header.setStyleSheet("font-weight: bold;")
+        queue_col.addWidget(self.queue_header)
+
+        self.queue_filter = QLineEdit()
+        self.queue_filter.setPlaceholderText("Filter queue…")
+        self.queue_filter.setClearButtonEnabled(True)
+        self.queue_filter.textChanged.connect(self._filter_queue)
+        queue_col.addWidget(self.queue_filter)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setStyleSheet("""
+            QListWidget::item:selected { background: #1a6fa8; color: white; }
+            QListWidget::item:selected:!active { background: #1a6fa8; color: white; }
+        """)
+        # Single-click jumps to that keyword. setCurrentRow (used for the
+        # highlight) does NOT emit itemClicked, so no feedback loop.
+        self.queue_list.itemClicked.connect(self._on_queue_click)
+        queue_col.addWidget(self.queue_list, stretch=1)
+
+        outer.addWidget(queue_panel)
+
+        qdiv = QFrame()
+        qdiv.setFrameShape(QFrame.Shape.VLine)
+        qdiv.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(qdiv)
+
         # ── Left: keyword info + image ──────────────────────────────────
         left = QWidget()
         left_col = QVBoxLayout(left)
@@ -1155,6 +1189,18 @@ class TagReviewWindow(QMainWindow):
         self.skip_btn.clicked.connect(self._skip)
         btn_row.addWidget(self.skip_btn)
 
+        self.blacklist_btn = QPushButton("Blacklist")
+        self.blacklist_btn.setMinimumHeight(42)
+        self.blacklist_btn.setToolTip(
+            "Reject this keyword: add it to settings.json keyword_blacklist (so it's "
+            "dropped on future runs) and remove its unmatched rows now"
+        )
+        self.blacklist_btn.setStyleSheet(
+            "QPushButton:enabled { background: #7a2a2a; color: white; }"
+        )
+        self.blacklist_btn.clicked.connect(self._blacklist)
+        btn_row.addWidget(self.blacklist_btn)
+
         right_col.addLayout(btn_row)
         outer.addWidget(right, stretch=2)
 
@@ -1242,6 +1288,7 @@ class TagReviewWindow(QMainWindow):
         ]
         if reset_index:
             self.current_idx = 0
+        self._rebuild_queue_list()
         self._show_current()
         self.statusBar().showMessage(
             f"Filter applied: {len(self.keywords)} keyword(s) with \u2265 {min_count} occurrence(s)"
@@ -1393,8 +1440,12 @@ class TagReviewWindow(QMainWindow):
         # stayed permanently dead until an app restart.
         self.new_tag_btn.setEnabled(True)
         self.skip_btn.setEnabled(True)
+        self.blacklist_btn.setEnabled(True)
         self.sel_label.setText("No tag selected")
         self.sel_label.setStyleSheet("color: #888;")
+
+        # Highlight this keyword in the queue pane
+        self._highlight_queue_current()
 
         # Update near-miss suggestions for this keyword
         self._update_near_misses(keyword)
@@ -1636,6 +1687,7 @@ class TagReviewWindow(QMainWindow):
         if self._bulk_dialog and self._bulk_dialog.isVisible():
             self._bulk_dialog.remove_keywords([keyword])
         # current_idx already points to the next item after removal
+        self._rebuild_queue_list()
         self._show_current()
 
     def _create_new_tag(self):
@@ -1768,6 +1820,7 @@ class TagReviewWindow(QMainWindow):
         # Keep bulk dialog in sync
         if self._bulk_dialog and self._bulk_dialog.isVisible():
             self._bulk_dialog.remove_keywords([keyword])
+        self._rebuild_queue_list()
         self._show_current()
 
     def _skip(self):
@@ -1777,6 +1830,99 @@ class TagReviewWindow(QMainWindow):
             )
             self.current_idx += 1
             self._show_current()
+
+    # ------------------------------------------------------------------
+    # Queue pane
+    # ------------------------------------------------------------------
+
+    def _rebuild_queue_list(self):
+        """Repopulate the far-left queue from self.keywords (respecting the
+        queue filter). Called whenever the keyword set changes."""
+        needle = self.queue_filter.text().strip().lower()
+        self.queue_list.blockSignals(True)
+        self.queue_list.clear()
+        for kw, cnt in self.keywords:
+            if needle and needle not in kw.lower():
+                continue
+            item = QListWidgetItem(f"{kw}  ({cnt})")
+            item.setData(Qt.ItemDataRole.UserRole, kw)
+            self.queue_list.addItem(item)
+        self.queue_list.blockSignals(False)
+        self.queue_header.setText(f"Queue ({len(self.keywords)})")
+        self._highlight_queue_current()
+
+    def _highlight_queue_current(self):
+        """Select the current keyword's row in the queue list (no rebuild)."""
+        if self.current_idx >= len(self.keywords):
+            self.queue_list.clearSelection()
+            return
+        cur_kw = self.keywords[self.current_idx][0]
+        for i in range(self.queue_list.count()):
+            if self.queue_list.item(i).data(Qt.ItemDataRole.UserRole) == cur_kw:
+                self.queue_list.setCurrentRow(i)
+                self.queue_list.scrollToItem(self.queue_list.item(i))
+                return
+        self.queue_list.clearSelection()
+
+    def _on_queue_click(self, item):
+        """Jump to the clicked keyword."""
+        kw = item.data(Qt.ItemDataRole.UserRole)
+        for i, (k, _c) in enumerate(self.keywords):
+            if k == kw:
+                self.current_idx = i
+                self._show_current()
+                return
+
+    def _filter_queue(self, _text):
+        self._rebuild_queue_list()
+
+    def _blacklist(self):
+        """Reject the current keyword: add it to settings.json keyword_blacklist
+        (dropped silently on future runs) and delete its unmatched rows now."""
+        if self.current_idx >= len(self.keywords):
+            return
+        keyword, _ = self.keywords[self.current_idx]
+
+        # Delete the unmatched rows
+        deleted = 0
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                "DELETE FROM image_keywords_unmatched WHERE keyword = %s", (keyword,))
+            deleted = cur.rowcount
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            QMessageBox.critical(self, "Database Error", f"Failed to blacklist:\n\n{e}")
+            return
+        finally:
+            cur.close()
+
+        # Merge into settings.json keyword_blacklist (engine drops it pre-logging)
+        try:
+            settings_path = Path(__file__).resolve().parent / 'settings.json'
+            with open(settings_path, encoding='utf-8') as f:
+                settings = json.load(f)
+            bl = set(settings.get('keyword_blacklist', []))
+            bl.add(keyword)
+            settings['keyword_blacklist'] = sorted(bl)
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Blacklisted '{keyword}' in DB, but settings.json update failed: {e}")
+        else:
+            self.statusBar().showMessage(
+                f"Blacklisted '{keyword}'  •  {deleted} unmatched row"
+                f"{'s' if deleted != 1 else ''} removed, added to keyword_blacklist")
+
+        # Remove from in-memory lists (current_idx already points at the next)
+        self.all_keywords = [(k, c) for k, c in self.all_keywords if k != keyword]
+        self.keywords = [(k, c) for k, c in self.keywords if k != keyword]
+        if self._bulk_dialog and self._bulk_dialog.isVisible():
+            self._bulk_dialog.remove_keywords([keyword])
+        self._rebuild_queue_list()
+        self._show_current()
 
     def _open_bulk_assign(self):
         """Open (or raise) the bulk-assign dialog."""
@@ -1825,9 +1971,11 @@ class TagReviewWindow(QMainWindow):
             for i, (k, _c) in enumerate(self.keywords):
                 if k == displayed:
                     self.current_idx = i
+                    self._rebuild_queue_list()
                     return
         # Displayed keyword was removed (or list exhausted): clamp & refresh
         self.current_idx = min(self.current_idx, len(self.keywords))
+        self._rebuild_queue_list()
         self._show_current()
 
     def _show_all_keywords(self):
@@ -1853,6 +2001,8 @@ class TagReviewWindow(QMainWindow):
         self.assign_btn.setEnabled(False)
         self.new_tag_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
+        self.blacklist_btn.setEnabled(False)
+        self._highlight_queue_current()
         self.statusBar().showMessage("Complete — lower the minimum or close the window.")
 
     # ------------------------------------------------------------------
