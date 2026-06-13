@@ -16,12 +16,15 @@ __pycache__/
 resources/*
 !resources/README.md
 
-# ── tag-reconcile working files (regenerated on demand by /tag-reconcile) ────
+# ── tag-reconcile / alias-audit working files (regenerated on demand) ───────
 tag_canonical.txt
 tag_unmatched.txt
 tag_review*.md
 tag_proposals*.json
 tag_reconcile_run*.js
+tag_aliases_audit.txt
+tag_alias_audit_results.json
+alias_audit_run.js
 
 # ── LLM model files ────────────────────────────────────────────────────────
 *.gguf
