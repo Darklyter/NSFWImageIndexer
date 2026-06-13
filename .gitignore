@@ -16,6 +16,13 @@ __pycache__/
 resources/*
 !resources/README.md
 
+# ── tag-reconcile working files (regenerated on demand by /tag-reconcile) ────
+tag_canonical.txt
+tag_unmatched.txt
+tag_review*.md
+tag_proposals*.json
+tag_reconcile_run*.js
+
 # ── LLM model files ────────────────────────────────────────────────────────
 *.gguf
 *.ggml
