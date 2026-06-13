@@ -1,3 +1,77 @@
+/*
+ * ===========================================================================
+ * TAG-RECONCILE RUNBOOK
+ * ===========================================================================
+ * Triages image_keywords_unmatched (keywords the VLM produced that didn't
+ * match the canonical vocabulary) into: aliases on existing tags, new tags,
+ * a keyword blacklist, or skip. Writes a reviewable proposal; you apply it
+ * with apply_tag_proposals.py after reviewing.
+ *
+ * WHEN TO RUN: after processing a batch of images, when unmatched has grown.
+ * Start at a HIGH threshold and work down (yield/term drops steeply):
+ *   ≥10 first, then ≥5, ≥3, ≥2. Singletons (count 1) are one-off noise —
+ *   not worth a pass. Anything that recurs climbs back above the threshold.
+ *
+ * PREREQUISITES: .venv present, DB reachable (creds in settings.json).
+ *
+ * ---------------------------------------------------------------------------
+ * HOW TO RUN — pick ONE:
+ *
+ * (A) SMALL remainder (<~800 terms): skip this workflow entirely. Just read
+ *     tag_unmatched.txt + tag_canonical.txt and classify inline by hand —
+ *     faster than a 50-agent fan-out and no reconstruction step. Produce the
+ *     same proposal JSON shape and apply with apply_tag_proposals.py.
+ *
+ * (B) LARGE sweep, RELIABLE method (preferred — avoids the args-binding
+ *     flakiness seen when invoking by name):
+ *       1. Refresh data + get the count at your threshold T:
+ *          .venv/Scripts/python -c "import json,psycopg2; s=json.load(open('settings.json',encoding='utf-8'));
+ *            c=psycopg2.connect(host=s['db_host'],port=s['db_port'],user=s['db_user'],password=s['db_password'],
+ *            dbname=s['db_name'],options='-c search_path=ai_captioning,public'); k=c.cursor();
+ *            k.execute('SELECT tag FROM tags ORDER BY tag'); open('tag_canonical.txt','w',encoding='utf-8').write('\n'.join(r[0] for r in k.fetchall()));
+ *            k.execute('SELECT keyword,COUNT(*) n FROM image_keywords_unmatched GROUP BY keyword HAVING COUNT(*)>=T ORDER BY n DESC');
+ *            rows=k.fetchall(); open('tag_unmatched.txt','w',encoding='utf-8').write('\n'.join(f'{n}\t{w}' for w,n in rows)); print('COUNT',len(rows))"
+ *       2. Make a hardcoded copy of THIS script with literals (no args):
+ *          replace `const threshold = (args && args.threshold) || 10` -> `const threshold = T`
+ *          replace `let count = (args && args.count) || 0`            -> `let count = <COUNT>`
+ *          write it to tag_reconcile_run<T>.js (gitignored).
+ *       3. Run it:  Workflow({ scriptPath: "<abs path>/tag_reconcile_run<T>.js" })
+ *
+ * (C) Quick/named (works most of the time, args occasionally don't bind):
+ *       Workflow({ name: "tag-reconcile", args: { threshold: 5, count: <N> } })
+ *     or the /tag-reconcile skill. If the run log says the wrong threshold,
+ *     fall back to (B).
+ *
+ * ---------------------------------------------------------------------------
+ * AFTER IT RUNS — the final "write:proposal" agent TRUNCATES the big JSON
+ * when echoing it verbatim. If tag_proposals_full.json has correct `totals`
+ * but short arrays, RECONSTRUCT from the agent transcripts:
+ *   dir: <project>/<session>/subagents/workflows/<runId>/*.jsonl
+ *   parse each line's message.content[] for tool_use name=="StructuredOutput";
+ *   collect inputs with `results` (classify), `verdicts` (verify),
+ *   `new_tags` (consolidate); apply verdict corrections; dedup by keyword;
+ *   write {aliases,new_tags,blacklist,skipped} to tag_proposals_full.json.
+ *
+ * REVIEW (the user wants review BEFORE apply): write tag_review_passN.md and
+ * surface new tags, name-collisions (auto-folded to aliases), low-confidence
+ * mappings, and a blacklist sample. The user is fine with med/low confidence;
+ * flag only clear misses (e.g. an object mapped to a tag).
+ *
+ * APPLY:  .venv/Scripts/python apply_tag_proposals.py [proposal.json] [--dry-run]
+ *   creates new tags (folding collisions into aliases on the existing tag),
+ *   adds all aliases, merges blacklist into settings.json keyword_blacklist +
+ *   deletes those unmatched rows, then promote_aliased_unmatched() retro-tags
+ *   every now-aliased image. Writes to PRODUCTION; reversible.
+ *
+ * keyword_blacklist (engine feature): exact model-output terms dropped in
+ * _resolve BEFORE unmatched logging. The user does NOT tag furniture / objects
+ * / settings / props / decor / garment-details — blacklist those.
+ *
+ * Working files (tag_canonical.txt, tag_unmatched.txt, tag_proposals*.json,
+ * tag_review*.md, tag_reconcile_run*.js) are gitignored; regenerated on demand.
+ * ===========================================================================
+ */
+
 export const meta = {
   name: 'tag-reconcile',
   description: 'Classify unmatched LLM keywords against the canonical tag vocabulary — map to existing tags, propose new tags, or blacklist objects/props — and write a reviewable proposal file',
