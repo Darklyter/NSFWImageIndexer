@@ -1321,6 +1321,29 @@ class StopProcessing(Exception):
     """
 
 
+# Actual sex-act terms. The content level 'explicit' is only correct when one
+# of these appears; visible nudity/genitals without an act is 'nudity'. The
+# VLM applies this gate inconsistently (over-calls 'explicit'), so the pipeline
+# enforces it deterministically. Deliberately omits ambiguous bare words like
+# "facial" (face) and "oral" (mouth) — only unambiguous act phrases.
+_SEX_ACT_RE = re.compile(
+    r'\b('
+    r'penetrat\w*|intercourse|blow\s?job|deep\s?throat|deepthroat|'
+    r'cunnilingus|fellatio|hand\s?job|tit\s?job|foot\s?job|rim\s?job|rimming|'
+    r'oral\s+sex|anal\s+sex|vaginal\s+sex|having\s+sex|sexual\s+intercourse|'
+    r'double\s+penetration|sixty[\s-]?nine|cum\s?shot|cumshot|cream\s?pie|'
+    r'creampie|masturbat\w*|finger(ing|ed)|ejaculat\w*|squirting|fisting|'
+    r'pegging|tribbing|spit\s?roast|cum\s+(on|in|covered)|cumming|'
+    r'giving\s+head|riding\s+(his|her|the|a)\s+(cock|dick|penis)|'
+    r'(cock|dick|penis)\s+in\s+(her|his|their|the)|'
+    r'(suck|lick|strok)\w*\s+(his|her|their|the|a)?\s*(cock|dick|penis|pussy|clit)'
+    r')\b', re.IGNORECASE)
+
+
+def _has_sex_act(text):
+    return bool(_SEX_ACT_RE.search(text or ''))
+
+
 # Single source of truth for the default system instruction — the GUI's
 # widget default and load_settings fallback previously disagreed with this,
 # so a fresh install silently ran with 'You are a helpful assistant.'
@@ -3642,6 +3665,19 @@ class FileProcessor:
                         continue
                     if _canon and not (blacklist and any(b in _canon.lower() for b in blacklist)):
                         all_keywords.add(_canon)
+
+        # Content-gate determinism: 'explicit' requires an actual sex act.
+        # The VLM over-calls it inconsistently (tags 'explicit' for plain
+        # nudity), so if 'explicit' is present but NO sex-act term appears in
+        # the raw keywords or the caption, demote it to 'nudity'. (Both are
+        # content-level passthrough tags, so they're bare-lowercase in the set.)
+        if 'explicit' in all_keywords:
+            _haystack = ' '.join(str(k) for k in new_keywords)
+            if _caption:
+                _haystack += ' ' + _caption
+            if not _has_sex_act(_haystack):
+                all_keywords.discard('explicit')
+                all_keywords.add('nudity')
 
         result = list(all_keywords)
         if return_debug:

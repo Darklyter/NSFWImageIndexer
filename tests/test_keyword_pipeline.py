@@ -197,6 +197,38 @@ class TestProcessKeywords:
         result = fp.process_keywords({}, ["watermark"])
         assert result == []
 
+    def test_explicit_demoted_to_nudity_without_sex_act(self):
+        # Topless / visible genitals, no act -> 'explicit' becomes 'nudity'
+        fp = make_fp()
+        result = fp.process_keywords(
+            {}, ["explicit", "medium breasts", "nude"],
+            caption="A nude woman sits on a bench, her vulva visible.")
+        assert "explicit" not in result
+        assert "nudity" in result
+
+    def test_explicit_kept_with_sex_act_keyword(self):
+        fp = make_fp()
+        result = fp.process_keywords(
+            {}, ["explicit", "blowjob"],
+            caption="She is performing a blowjob on a man.")
+        assert "explicit" in result
+        assert "nudity" not in result
+
+    def test_explicit_kept_with_sex_act_in_caption_only(self):
+        fp = make_fp()
+        result = fp.process_keywords(
+            {}, ["explicit"], caption="The couple are having vaginal sex.")
+        assert "explicit" in result
+
+    def test_facial_features_does_not_count_as_sex_act(self):
+        # "facial expression" must NOT keep 'explicit' (ambiguous word guard)
+        fp = make_fp()
+        result = fp.process_keywords(
+            {}, ["explicit", "nude"],
+            caption="Her facial expression is neutral; she is nude.")
+        assert "explicit" not in result
+        assert "nudity" in result
+
     def test_keyword_blacklist_drops_silently(self):
         fp = make_fp()
         fp.config.keyword_blacklist = ["toy gun", "popcorn"]
