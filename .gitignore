@@ -24,7 +24,10 @@ tag_proposals*.json
 tag_reconcile_run*.js
 tag_aliases_audit.txt
 tag_alias_audit_results.json
+tag_assorted_results.json
+tag_assorted_review.md
 alias_audit_run.js
+assorted_recover_run.js
 
 # ── LLM model files ────────────────────────────────────────────────────────
 *.gguf
